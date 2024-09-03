@@ -33,7 +33,7 @@ async fn main() {
 
     match matches.subcommand() {
         Some((downloader::DOWNLOAD_SUBCOMMAND, sub_matches)) => downloader::download(*sub_matches.get_one::<usize>("subsetCount").unwrap()).await,
-        Some((tokenizer::GENERATE_VOCAB_SUBCOMMAND, _)) => tokenizer::build_token_map(),
+        Some((tokenizer::GENERATE_VOCAB_SUBCOMMAND, _)) => tokenizer::build_token_map().await,
         _ => unreachable!(),
     }
 }

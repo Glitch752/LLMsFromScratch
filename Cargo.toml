@@ -13,3 +13,4 @@ reqwest = { version = "0.12.7", features = ["stream"] }
 tokio = { version = "1.40.0", features = ["full"] }
 tokio-tar = "0.3.1"
 xz2 = "0.1.7"
+hashbrown = "0.14"

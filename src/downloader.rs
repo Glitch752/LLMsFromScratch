@@ -3,8 +3,8 @@ use std::{io::Read, path::PathBuf};
 /// This module manages downloading a dataset from Hugging Face. I'm using the [OpenWebText dataset](https://huggingface.co/datasets/Skylion007/openwebtext), and this is hard-coded for now.
 
 use clap::{Arg, Command};
-use futures_util::{Stream, StreamExt};
-use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, task::JoinSet};
+use futures_util::StreamExt;
+use tokio::{io::AsyncWriteExt, task::JoinSet};
 
 use crate::DATA_PATH;
 
@@ -14,7 +14,7 @@ pub fn cli() -> Command {
         .about("Download the OpenWebText dataset from Hugging Face.")
         .arg(Arg::new("subsetCount")
             .short('s').long("subset-count")
-            .help("The number of subsets to download. Each subset will extract to roughly 2GB! The data contains 20 subsets in total, equating to 41.7GB of data.")
+            .help("The number of subsets to download. Each subset will extract to roughly 2.7GB! The data contains 21 subsets in total, equating to 55.2GB of data.")
             .default_value("1")
             .value_parser(parse_subset_count))
 }
@@ -23,10 +23,10 @@ fn parse_subset_count(value: &str) -> Result<usize, String> {
     let parsed_value = value.parse::<usize>();
     match parsed_value {
         Ok(count) => {
-            if count > 0 && count <= 20 {
+            if count > 0 && count <= 21 {
                 Ok(count)
             } else {
-                Err("subsetCount must be a positive integer between 1 and 20.".to_string())
+                Err("subsetCount must be a positive integer between 1 and 21.".to_string())
             }
         }
         Err(_) => Err("subsetCount must be a positive integer.".to_string())
@@ -59,7 +59,7 @@ pub async fn download(subsets: usize) {
 async fn download_subset(index: usize, subsets: usize, client: reqwest::Client, data_path: PathBuf, multi_progress: indicatif::MultiProgress) {
     let progress_bar =
         indicatif::ProgressBar::new(1)
-        .with_prefix(format!("Subset {}/{}", index + 1, subsets))
+        .with_prefix(format!("Subset {:02}/{}", index + 1, subsets))
         .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap());
     multi_progress.add(progress_bar.clone());
         
@@ -72,7 +72,7 @@ async fn download_subset(index: usize, subsets: usize, client: reqwest::Client, 
 
     if !subset_path.exists() {
         let subset_url = get_subset_url(index);
-        progress_bar.set_message(format!("Downloading from {}...", subset_url));
+        progress_bar.set_message("Downloading...");
 
         let response = client.head(&subset_url).send().await.unwrap();
         let content_length = response.headers().get("content-length").unwrap().to_str().unwrap().parse::<u64>().unwrap();
@@ -122,7 +122,7 @@ async fn download_subset(index: usize, subsets: usize, client: reqwest::Client, 
         }
 
         progress_bar.set_length(files.len() as u64);
-        progress_bar.reset_elapsed();
+        progress_bar.set_position(0);
 
         progress_bar.set_message("Extracting subset child xz files...");
 
