@@ -1,10 +1,11 @@
 /// This is a basic byte-pair encoding tokenizer. It is used to tokenize the input text into subwords.
 
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, ops::Range, path::PathBuf, sync::Arc};
 use clap::Command;
-use indicatif::ProgressBar;
+use indicatif::{MultiProgress, ProgressBar};
 use lazy_static::lazy_static;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
+use tokio::task::JoinSet;
 use crate::{downloader::DOWNLOAD_SUBCOMMAND, DATA_PATH};
 
 pub const GENERATE_VOCAB_SUBCOMMAND: &str = "build_token_map";
@@ -22,24 +23,59 @@ lazy_static! {
     pub static ref MERGES_FILE: PathBuf = DATA_PATH.join("merges.txt");
 }
 
+fn make_printable_map() -> HashMap<char, char> {
+    fn add_range(map: &mut HashSet<char>, range: Range<char>) {
+        for i in range {
+            map.insert(i);
+        }
+    }
+
+    let mut already_printable = HashSet::new();
+    add_range(&mut already_printable, '!'..'~');
+    add_range(&mut already_printable, '¡'..'¬');
+    add_range(&mut already_printable, '®'..'ÿ');
+
+    let mut map = HashMap::new();
+    // All characters that are not printable ASCII characters are mapped to a printable character by adding 256 to their value.
+    for i in 0..=255 {
+        let c = char::from_u32(i).unwrap();
+        if !already_printable.contains(&c) {
+            map.insert(c, char::from_u32(i + 256).unwrap());
+        }
+    }
+
+    map
+}
+
+#[derive(Clone, Debug)]
 pub struct Tokenizer {
     merges: HashMap<(usize, usize), usize>,
 
     token_map: HashMap<String, usize>,
     reverse_token_map: HashMap<usize, String>,
+
+    encode_map: HashMap<char, char>,
+    decode_map: HashMap<char, char>,
 }
 
 impl Tokenizer {
+    fn new() -> Self {
+        let printable_map = make_printable_map();
+        Tokenizer {
+            merges: HashMap::new(),
+            token_map: HashMap::new(),
+            reverse_token_map: HashMap::new(),
+            encode_map: printable_map.clone(),
+            decode_map: printable_map.into_iter().map(|(a, b)| (b, a)).collect(),
+        }
+    }
+
     pub fn load() -> Self {
         if !VOCAB_FILE.exists() || !MERGES_FILE.exists() {
             panic!("Vocabulary file not found; cannot run tokenizer. Please run `{}` and `{}` first.", DOWNLOAD_SUBCOMMAND, GENERATE_VOCAB_SUBCOMMAND); // TODO: Proper error handling
         }
 
-        let tokenizer = Tokenizer {
-            merges: HashMap::new(),
-            token_map: HashMap::new(),
-            reverse_token_map: HashMap::new(),
-        };
+        let tokenizer = Tokenizer::new();
         // TODO: Load with bincode
         tokenizer
     }
@@ -57,49 +93,39 @@ impl Tokenizer {
             panic!("No subsets found in the data folder. Please run the `download` command first.");
         }
 
-        let mut tokenizer = Tokenizer {
-            merges: HashMap::new(),
-            token_map: HashMap::new(),
-            reverse_token_map: HashMap::new(),
-        };
-
+        let mut tokenizer = Tokenizer::new();
         tokenizer.add_token(UNKNOWN_TOKEN.to_string());
         tokenizer.add_token(ENDOFTEXT_TOKEN.to_string());
 
         println!("Running preliminary pass to create individual character tokens...");
 
         // First, we run a preliminary pass to create individual character tokens.
+        let multi_progress = Arc::new(MultiProgress::new());
+        let mut tasks = JoinSet::new();
         for subset in fs::read_dir(subsets_folder.clone()).unwrap().enumerate() {
-            // TEMPORARY: only use the first subset for testing purposes
-            if subset.0 > 0 {
-                break;
-            }
+            let subset = (subset.0, subset.1.unwrap());
+            tasks.spawn(Self::preprocess_subset(subset, multi_progress.clone()));
+        }
+        let token_sets = tasks.join_all().await;
 
-            let subset = subset.1.unwrap();
-            let progress = ProgressBar::new(fs::read_dir(subset.path()).unwrap().count() as u64)
-                .with_prefix("Processing subset")
-                .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap());
+        println!("Merging threads' results...");
 
-            let files = fs::read_dir(subset.path()).unwrap();
-            for file in files {
-                let file = file.unwrap();
-                let path = file.path();
-                let text: String = fs::read_to_string(path).unwrap();
+        let final_set: HashSet<char> = token_sets.into_iter().flatten().collect();
 
-                for c in text.chars() {
-                    let token = c.to_string();
-                    if !tokenizer.token_map.contains_key(&token) {
-                        tokenizer.add_token(token);
-                    }
-                }
-                
-                progress.inc(1);
-            }
-
-            progress.finish();
+        for c in final_set {
+            tokenizer.add_token(c.to_string());
         }
 
         println!("Preprocessing complete. Found {} single-character tokens.", tokenizer.token_map.len());
+
+        // Temporary: dump the token map to a file
+        let mut vocab_file = fs::File::create(VOCAB_FILE.clone()).unwrap();
+        for (token, id) in tokenizer.token_map.iter() {
+            vocab_file.write_all(format!("{}\t{}\n", token, id).as_bytes()).unwrap();
+        } 
+        
+        // Temporary: return
+        return tokenizer;
 
         // Next, we run the BPE algorithm to create subword tokens until we reach the desired vocabulary size.
         while tokenizer.token_map.len() < VOCAB_SIZE {
@@ -157,6 +183,35 @@ impl Tokenizer {
         println!("Tokenizer built with {} tokens.", tokenizer.token_map.len());
 
         tokenizer
+    }
+
+    async fn preprocess_subset(subset: (usize, fs::DirEntry), multi_progress: Arc<MultiProgress>) -> HashSet<char> {
+        let (index, subset) = subset;
+
+        let progress = multi_progress.add(
+            ProgressBar::new(fs::read_dir(subset.path()).unwrap().count() as u64)
+                .with_prefix(format!("Processing subset {}", index))
+                .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap())
+        );
+
+        let mut tokens = HashSet::new();
+
+        let files = fs::read_dir(subset.path()).unwrap();
+        for file in files {
+            let file = file.unwrap();
+            let path = file.path();
+            let text: String = fs::read_to_string(path).unwrap();
+
+            for c in text.chars() {
+                tokens.insert(c);
+            }
+            
+            progress.inc(1);
+        }
+
+        progress.finish_with_message("Subset processed.");
+
+        tokens
     }
 
     /// Converts a text into a list of token IDs.

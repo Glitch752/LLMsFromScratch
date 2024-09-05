@@ -1,4 +1,4 @@
-use std::{io::Read, path::PathBuf};
+use std::{io::Read, path::PathBuf, sync::Arc};
 
 /// This module manages downloading a dataset from Hugging Face. I'm using the [OpenWebText dataset](https://huggingface.co/datasets/Skylion007/openwebtext), and this is hard-coded for now.
 
@@ -43,7 +43,7 @@ pub async fn download(subsets: usize) {
     let client = reqwest::Client::new();
     let data_path = DATA_PATH.join("data");
 
-    let multi_progress = indicatif::MultiProgress::new();
+    let multi_progress = Arc::new(indicatif::MultiProgress::new());
 
     // Asynchronously download each subset
     let mut set = JoinSet::new();
@@ -56,12 +56,12 @@ pub async fn download(subsets: usize) {
     println!("Finished downloading {} subsets of the OpenWebText dataset to {}", subsets, crate::DATA_PATH.display());
 }
 
-async fn download_subset(index: usize, subsets: usize, client: reqwest::Client, data_path: PathBuf, multi_progress: indicatif::MultiProgress) {
-    let progress_bar =
+async fn download_subset(index: usize, subsets: usize, client: reqwest::Client, data_path: PathBuf, multi_progress: Arc<indicatif::MultiProgress>) {
+    let progress_bar = multi_progress.add(
         indicatif::ProgressBar::new(1)
-        .with_prefix(format!("Subset {:02}/{}", index + 1, subsets))
-        .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap());
-    multi_progress.add(progress_bar.clone());
+            .with_prefix(format!("Subset {:02}/{}", index + 1, subsets))
+            .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap())
+    );
         
     // First, download the actual .tar file and show a progress bar
     let subset_filename = format!("subsets/urlsf_subset{:02}.tar", index);
