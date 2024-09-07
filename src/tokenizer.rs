@@ -1,16 +1,30 @@
 /// This is a basic byte-pair encoding tokenizer. It is used to tokenize the input text into subwords.
 
-use std::{fs, path::PathBuf};
-use clap::Command;
-use indicatif::ProgressBar;
+use std::{fs, io::Write, path::PathBuf, sync::Arc};
+use clap::{Arg, Command};
+use indicatif::{MultiProgress, ProgressBar};
 use lazy_static::lazy_static;
 use hashbrown::HashMap;
+use serde::{Serialize, Deserialize};
+use tokio::task::JoinSet;
 use crate::{downloader::DOWNLOAD_SUBCOMMAND, DATA_PATH};
 
 pub const GENERATE_VOCAB_SUBCOMMAND: &str = "build_token_map";
-pub fn cli() -> Command {
+pub fn generate_vocab_cli() -> Command {
     Command::new(GENERATE_VOCAB_SUBCOMMAND)
         .about("Build the token map for the tokenizer from the training data.")
+}
+pub const TOKENIZE_SUBCOMMAND: &str = "tokenize";
+pub fn tokenize_cli() -> Command {
+    Command::new(TOKENIZE_SUBCOMMAND)
+        .about("Tokenize a string using the tokenizer. Input is a string of text.")
+        .arg(Arg::new("text").help("The text to tokenize.").required(true))
+}
+pub const DETOKENIZE_SUBCOMMAND: &str = "detokenize";
+pub fn detokenize_cli() -> Command {
+    Command::new(DETOKENIZE_SUBCOMMAND)
+        .about("Detokenize a list of token IDs using the tokenizer. Input is a list of integers separated by spaces.")
+        .arg(Arg::new("tokens").help("The list of token IDs to detokenize.").required(true))
 }
 
 const UNKNOWN_TOKEN: &str = "<|unk|>";
@@ -22,13 +36,21 @@ lazy_static! {
     pub static ref MERGES_FILE: PathBuf = DATA_PATH.join("merges.txt");
 }
 
+/// A map from pairs of tokens to the BPE rank. Lower ranks indicate more frequent pairs.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Merges(HashMap<(String, String), usize>);
+
+/// A map from token string to token ID.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct TokenMap(HashMap<String, usize>);
+
 #[derive(Clone, Debug)]
 pub struct Tokenizer {
     /// Map from pairs of tokens to the BPE rank. Lower ranks indicate more frequent pairs.
-    merges: HashMap<(String, String), usize>,
+    merges: Merges,
 
     /// Map from token string to token ID.
-    token_map: HashMap<String, usize>,
+    token_map: TokenMap,
     /// Map from token ID to token string.
     reverse_token_map: HashMap<usize, String>,
 
@@ -36,27 +58,11 @@ pub struct Tokenizer {
     bpe_cache: HashMap<String, Vec<String>>,
 }
 
-fn min_by_key<T, K: Ord>(iter: impl IntoIterator<Item = T>, key: impl Fn(&T) -> K) -> Option<T> {
-    let mut iter = iter.into_iter();
-    let mut min = iter.next()?;
-    let mut min_key = key(&min);
-
-    for item in iter {
-        let item_key = key(&item);
-        if item_key < min_key {
-            min = item;
-            min_key = item_key;
-        }
-    }
-
-    Some(min)
-}
-
 impl Tokenizer {
     fn new() -> Self {
         Tokenizer {
-            merges: HashMap::new(),
-            token_map: HashMap::new(),
+            merges: Merges(HashMap::new()),
+            token_map: TokenMap(HashMap::new()),
             reverse_token_map: HashMap::new(),
             bpe_cache: HashMap::new(),
         }
@@ -67,16 +73,26 @@ impl Tokenizer {
             panic!("Vocabulary file not found; cannot run tokenizer. Please run `{}` and `{}` first.", DOWNLOAD_SUBCOMMAND, GENERATE_VOCAB_SUBCOMMAND); // TODO: Proper error handling
         }
 
-        let tokenizer = Tokenizer::new();
-        // TODO: Load with bincode
+        let mut tokenizer = Tokenizer::new();
+        
+        let vocab_file = fs::File::open(VOCAB_FILE.clone()).unwrap();
+        let merges_file = fs::File::open(MERGES_FILE.clone()).unwrap();
+        let token_map: TokenMap = bincode::deserialize_from(vocab_file).unwrap();
+        let merges: Merges = bincode::deserialize_from(merges_file).unwrap();
+        
+        tokenizer.token_map = token_map;
+        tokenizer.merges = merges;
+        tokenizer.reverse_token_map = tokenizer.token_map.0.iter().map(|(k, v)| (*v, k.clone())).collect();
+
         tokenizer
     }
 
-    fn add_token(&mut self, token: String) {
-        let value = self.token_map.len();
-        self.token_map.insert(token.clone(), value);
+    fn add_token(&mut self, token: String) -> usize {
+        let value = self.token_map.0.len();
+        self.token_map.0.insert(token.clone(), value);
         self.reverse_token_map.insert(value, token);
         self.bpe_cache.clear(); // Clear the cache since the token map has changed
+        value
     }
     
     pub async fn build_token_map() -> Self {
@@ -98,66 +114,110 @@ impl Tokenizer {
 
         // This is mostly temporary since it doesn't scale to large datasets. However, I think it's okay if we
         // only build the tokenizer based on the data that can fit in memory.
-        let subset_count = 1; // For now, we just analyze the first subset
-        println!("Loading {} subsets into memory...", subset_count);
-        let mut inputs: Vec<String> = vec![];
+        let max_subset_count = 21;
+        println!("Loading {} subsets into memory...", max_subset_count.min(subsets_available));
+        // We need to split the inputs into chunks so we can process them in parallel, but we can't clone the data.
+        let threads = num_cpus::get();
+        let mut inputs: Vec<Vec<String>> = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            inputs.push(vec![]);
+        }
+
         let subsets = fs::read_dir(subsets_folder.clone())
             .unwrap()
-            .take(subset_count)
+            .take(max_subset_count)
             .map(|subset| subset.unwrap());
-        for subset in subsets {
-            let i = 0;
-            let progress = ProgressBar::new(fs::read_dir(subset.path()).unwrap().count() as u64)
-                .with_prefix("Loading subset")
+        for (index, subset) in subsets.enumerate() {
+            let file_count = fs::read_dir(subset.path()).unwrap().count();
+            let progress = ProgressBar::new(file_count as u64)
+                .with_prefix(format!("Loading subset {:02}", index))
                 .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap());
+            inputs.iter_mut().for_each(|input| input.reserve(file_count / threads));
 
             let files = fs::read_dir(subset.path()).unwrap();
-            for file in files {
+            for (index, file) in files.enumerate() {
                 let file = file.unwrap();
                 let path = file.path();
                 let contents = fs::read_to_string(path).unwrap();
-                inputs.push(contents);
+                
+                inputs.get_mut(index % threads).unwrap().push(contents);
 
                 progress.inc(1);
             }
 
             progress.finish();
         }
-        println!("Loaded {} subsets into memory.", subset_count);
+        let inputs = inputs.into_iter().map(Arc::new).collect::<Vec<_>>();
+        println!("Loaded {} subsets into memory.", max_subset_count);
 
         // Next, we run the BPE algorithm to create subword tokens until we reach the desired vocabulary size.
-        while tokenizer.token_map.len() < VOCAB_SIZE {
-            let mut frequencies = HashMap::<(usize, usize), usize>::new();
-            
+        while tokenizer.token_map.0.len() < VOCAB_SIZE {
             // Count the frequencies of all pairs of tokens
-            let progress = ProgressBar::new(inputs.len() as u64)
-                .with_prefix("Counting token pairs")
-                .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap());
-            for input in inputs {
-                if tokenizer.bpe_cache.len() > 50_000 {
-                    tokenizer.bpe_cache.clear(); // Clear the cache periodically so it doesn't get ridiculously large
-                }
+            let multi_progress = MultiProgress::new();
+            
+            let mut thread_join = JoinSet::new();
+            for (index, chunk) in inputs.iter().enumerate() {
+                let chunk = chunk.clone();
+                let progress = multi_progress.clone();
+                let mut tokenizer = tokenizer.clone();
+                thread_join.spawn(async move {
+                    let mut thread_frequencies = HashMap::<(String, String), usize>::new();
+            
+                    let progress = progress.add(ProgressBar::new(chunk.len() as u64)
+                        .with_prefix(format!("Counting token pairs; thread {:02}/{:02}", index, threads))
+                        .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap()));
+                    
+                    for input in chunk.iter() {
+                        if tokenizer.bpe_cache.len() > 1_000_000 {
+                            tokenizer.bpe_cache.clear(); // Clear the cache periodically so it doesn't get ridiculously large
+                        }
 
-                let tokens = tokenizer.tokenize(&input);
-                for i in 0..tokens.len() - 1 {
-                    *frequencies.entry((tokens[i], tokens[i + 1])).or_insert(0) += 1;
-                }
-                progress.inc(1);
+                        let preliminary_tokens = split_into_preliminary_tokens(input);
+                        for preliminary_token in preliminary_tokens {
+                            let tokens = tokenizer.bpe(preliminary_token);
+                            for i in 0..tokens.len() - 1 {
+                                *thread_frequencies.entry((tokens[i].to_owned(), tokens[i + 1].to_owned())).or_insert(0) += 1;
+                            }
+                        }
+                
+                        progress.inc(1);
+                    }
+                    progress.finish();
+
+                    thread_frequencies
+                });
             }
-            progress.finish();
-
-            // Print the frequencies, sorted from low to high
-            let mut frequencies: Vec<_> = frequencies.into_iter().collect();
-            frequencies.sort_by_key(|(_, freq)| *freq);
-            for (pair, freq) in frequencies.iter() {
-                println!("{:?}: {}", pair, freq);
+            let values = thread_join.join_all().await;
+            let mut frequencies = HashMap::<(String, String), usize>::new();
+            for value in values {
+                for (pair, count) in value {
+                    *frequencies.entry(pair).or_insert(0) += count;
+                }
             }
 
-            // For now, stop looping
-            break;
+            // Find the most frequent pair of tokens
+            let most_frequent_pair = frequencies.iter().max_by_key(|(_, &count)| count);
+            if most_frequent_pair.is_none() {
+                break; // If we didn't find a pair, we're done
+            }
+
+            let pair = most_frequent_pair.unwrap();
+            let (first, second) = pair.0;
+            let id = tokenizer.add_token(format!("{}{}", first, second));
+            tokenizer.merges.0.insert((pair.0.0.clone(), pair.0.1.clone()), id);
+
+            println!("Merging pair {:?} into token #{}.", pair, id);
         }
+
+        println!("Tokenizer built with {} tokens. Saving to disk...", tokenizer.token_map.0.len());
+
+        // Write the token map and merges to disk
+        let mut vocab_file = fs::File::create(VOCAB_FILE.clone()).unwrap();
+        let mut merges_file = fs::File::create(MERGES_FILE.clone()).unwrap();
+        vocab_file.write_all(bincode::serialize(&tokenizer.token_map).unwrap().as_slice()).unwrap();
+        merges_file.write_all(bincode::serialize(&tokenizer.merges).unwrap().as_slice()).unwrap();
         
-        println!("Tokenizer built with {} tokens.", tokenizer.token_map.len());
+        println!("Saved tokenizer vocab and merges.");
 
         tokenizer
     }
@@ -187,23 +247,24 @@ impl Tokenizer {
 
         loop {
             // First, we find the most important pair to merge (meaning the pair that occurs most frequently)
-            let most_important_pair = min_by_key(pairs, |pair| self.merges.get(pair).unwrap_or(&usize::MAX));
-            if most_important_pair.is_none() { // If we didn't find a pair to merge, we're done
+            let most_important_pair = pairs.iter().map(|pair| (pair, self.merges.0.get(pair).unwrap_or(&usize::MAX))).min_by_key(|(_, index)| **index);
+            // If we didn't find a pair to merge, we're done
+            if most_important_pair.is_none() || *most_important_pair.unwrap().1 == usize::MAX {
                 break;
             }
-            let (first, second) = most_important_pair.unwrap();
+            let (first, second) = most_important_pair.unwrap().0;
 
             // Next, we merge the pair
             let mut new_tokens = vec![];
             let mut i = 0;
             while i < tokens.len() {
-                let j = tokens.iter().skip(i).position(|token| *token == first);
+                let j = tokens.iter().skip(i).position(|token| token == first);
                 if let Some(j) = j {
                     new_tokens.extend(tokens[i..i + j].iter().cloned());
                     i += j;
                 }
 
-                if i < tokens.len() - 1 && tokens[i + 1] == second {
+                if i < tokens.len() - 1 && tokens[i + 1] == *second {
                     new_tokens.push(format!("{}{}", first, second));
                     i += 2;
                 } else {
@@ -214,7 +275,7 @@ impl Tokenizer {
 
             tokens = new_tokens;
 
-            // If the new string is only one character long, we're done
+            // If we only have one token left, we're done
             if tokens.len() == 1 {
                 break;
             }
@@ -235,7 +296,7 @@ impl Tokenizer {
 
         let mut bytepair_tokens: Vec<usize> = vec![];
         for preliminary_token in preliminary_tokens {
-            bytepair_tokens.extend(self.bpe(preliminary_token).iter().map(|token| *self.token_map.get(token).unwrap_or(self.token_map.get(UNKNOWN_TOKEN).unwrap())));
+            bytepair_tokens.extend(self.bpe(preliminary_token).iter().map(|token| *self.token_map.0.get(token).unwrap_or(self.token_map.0.get(UNKNOWN_TOKEN).unwrap())));
         }
 
         bytepair_tokens
@@ -349,4 +410,18 @@ fn split_into_preliminary_tokens(text: &str) -> Vec<&str> {
     }
 
     tokens
+}
+
+pub async fn tokenize(text: String) {
+    let mut tokenizer = Tokenizer::load();
+    let tokens = tokenizer.tokenize(&text);
+    println!("Token IDs: {:?}", tokens);
+    println!("Token literals: {:?}", tokens.iter().map(|token| tokenizer.reverse_token_map.get(token).unwrap()).collect::<Vec<&String>>());
+}
+
+pub async fn detokenize(tokens: String) {
+    let tokenizer = Tokenizer::load();
+    let tokens: Vec<usize> = tokens.split_whitespace().map(|token| token.replace(",", "").parse().unwrap()).collect();
+    let text = tokenizer.detokenize(&tokens);
+    println!("{}", text);
 }

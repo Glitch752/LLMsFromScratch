@@ -21,7 +21,9 @@ fn cli() -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(downloader::cli())
-        .subcommand(tokenizer::cli())
+        .subcommand(tokenizer::generate_vocab_cli())
+        .subcommand(tokenizer::tokenize_cli())
+        .subcommand(tokenizer::detokenize_cli())
 }
 
 #[tokio::main]
@@ -34,6 +36,8 @@ async fn main() {
     match matches.subcommand() {
         Some((downloader::DOWNLOAD_SUBCOMMAND, sub_matches)) => downloader::download(*sub_matches.get_one::<usize>("subsetCount").unwrap()).await,
         Some((tokenizer::GENERATE_VOCAB_SUBCOMMAND, _)) => _ = tokenizer::Tokenizer::build_token_map().await,
+        Some((tokenizer::TOKENIZE_SUBCOMMAND, sub_matches)) => _ = tokenizer::tokenize(sub_matches.get_one::<String>("text").unwrap().clone()).await,
+        Some((tokenizer::DETOKENIZE_SUBCOMMAND, sub_matches)) => _ = tokenizer::detokenize(sub_matches.get_one::<String>("tokens").unwrap().clone()).await,
         _ => unreachable!(),
     }
 }
