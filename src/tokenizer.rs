@@ -2,6 +2,7 @@
 
 use std::{fs, io::Write, path::PathBuf, sync::{Arc, RwLock}};
 use clap::{Arg, Command};
+use indexmap::IndexMap;
 use indicatif::{MultiProgress, ProgressBar};
 use lazy_static::lazy_static;
 use hashbrown::{Equivalent, HashMap};
@@ -15,6 +16,7 @@ pub fn generate_vocab_cli() -> Command {
     Command::new(GENERATE_VOCAB_SUBCOMMAND)
         .about("Build the token map for the tokenizer from the training data.")
         .arg(Arg::new("continue").help("Continue building the token map from the last saved state.").long("continue").action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("data_ratio").help("The ratio of the data to use for building the token map.").long("data-ratio").default_value("0.02").value_parser(|v: &str| v.parse::<f64>()))
 }
 pub const TOKENIZE_SUBCOMMAND: &str = "tokenize";
 pub fn tokenize_cli() -> Command {
@@ -115,7 +117,7 @@ impl Tokenizer {
         value
     }
     
-    pub async fn build_token_map(load_previous: bool) -> Self {
+    pub async fn build_token_map(load_previous: bool, data_ratio: f64) -> Self {
         let subsets_folder = DATA_PATH.join("data/extracted");
         let subsets_available = fs::read_dir(subsets_folder.clone()).unwrap().count();
         if subsets_available == 0 {
@@ -140,7 +142,7 @@ impl Tokenizer {
 
         // This is mostly temporary since it doesn't scale to large datasets. However, I think it's okay if we
         // only build the tokenizer based on the data that can fit in memory.
-        let max_subset_count = 1;
+        let max_subset_count = (subsets_available as f64 * data_ratio).ceil() as usize;
         println!("Loading {} subsets into memory...", max_subset_count.min(subsets_available));
         // We need to split the inputs into chunks so we can process them in parallel, but we can't clone the data.
         let threads = num_cpus::get();
@@ -155,7 +157,10 @@ impl Tokenizer {
             .take(max_subset_count)
             .map(|subset| subset.unwrap());
         for (index, subset) in subsets.enumerate() {
-            let file_count = fs::read_dir(subset.path()).unwrap().count();
+            let count = fs::read_dir(subset.path()).unwrap().count();
+            let max_take = if index == max_subset_count - 1 { ((data_ratio * 21.).fract() * count as f64).floor() as usize / SIMULTANEOUS_FILE_LOADS } else { usize::MAX };
+            let file_count = count.min(max_take * SIMULTANEOUS_FILE_LOADS);
+
             let progress = ProgressBar::new(file_count as u64)
                 .with_prefix(format!("Loading subset {:02}", index))
                 .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:90.cyan/blue} {pos}/{len} {msg}").unwrap());
@@ -163,7 +168,7 @@ impl Tokenizer {
 
             let files = fs::read_dir(subset.path()).unwrap();
             let mut chunks = files.array_chunks::<SIMULTANEOUS_FILE_LOADS>();
-            for files in chunks.by_ref() {
+            for files in chunks.by_ref().take(max_take) {
                 let content_futures = files.map(|file| tokio::fs::read_to_string(file.unwrap().path()));
                 let contents = futures_util::future::join_all(content_futures).await.into_iter().collect::<Result<Vec<String>, _>>().unwrap();
                 for content in contents.into_iter() {
@@ -190,7 +195,7 @@ impl Tokenizer {
 
         // Next, run the BPE algorithm in parallel on the chunks of data.
         let multi_progress = MultiProgress::new();
-        let mut thread_join = JoinSet::new();
+        let mut thread_join: JoinSet<String> = JoinSet::new();
         for (index, chunk) in token_chunks.iter().enumerate() {
             let chunk = chunk.clone();
             let mut tokenizer = tokenizer.clone();
@@ -200,15 +205,23 @@ impl Tokenizer {
                     .with_prefix(format!("Tokenizing data; thread {:02}/{:02}", index, threads))
                     .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len}").unwrap()));
                 
-                let mut new_chunk: Vec<Option<CompactString>> = Vec::with_capacity(chunk.len() * 2); // Low estimate of the number of tokens we'll have
+                let mut new_chunk: String = String::new();
                 for input in chunk.iter() {
                     let preliminary_tokens = Tokenizer::split_into_preliminary_tokens(input);
-                    new_chunk.reserve(preliminary_tokens.len());
-
                     for preliminary_token in preliminary_tokens {
-                        let tokens = tokenizer.bpe(preliminary_token).into_iter().map(Some);
-                        new_chunk.extend(tokens);
+                        // We use a null byte as a separator, so we need to remove it from the input. I could probably replace it with something else, but we realistically don't need to generate null bytes.
+                        let tokens = tokenizer.bpe(preliminary_token).into_iter().map(|s| s.replace("\0", "")).map(Some);
+                        for token in tokens {
+                            new_chunk.push_str(&token.unwrap());
+                            new_chunk.push('\0'); // We use a null byte as a separator
+                        }
+                        // Add an extra null token to the end of this split token
+                        new_chunk.push('\0');
                     }
+
+                    // The null separators indicate boundaries as follows:
+                    // - 1 null byte: End of a token (so this is the boundary of a pair)
+                    // - 2 null bytes: End of a token and end of a preliminary token (so don't count a pair across this boundary)
 
                     progress.inc(1);
                 }
@@ -236,47 +249,58 @@ impl Tokenizer {
                 let chunk = chunk.clone();
                 let progress = multi_progress.clone();
                 thread_join.spawn(async move {
-                    let mut thread_frequencies = HashMap::<StringPair, usize>::new();
-            
-                    let chunk = &chunk.try_read().expect("Somehow the RwLock is messed up");
-
-                    let progress = progress.add(ProgressBar::new(chunk.len() as u64 * 2)
-                        .with_prefix(format!("Counting token pairs; thread {:02}/{:02}", index + 1, threads))
-                        .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} (Overestimated bar length)").unwrap()));
-                    
-                    for i in 0..chunk.len() - 1 {
-                        let pair = (chunk[i].to_owned().unwrap(), chunk[i + 1].to_owned().unwrap());
-                        if pair.0 == ENDOFTEXT_TOKEN || pair.1 == ENDOFTEXT_TOKEN {
-                            continue;
-                        }
-
-                        thread_frequencies.get_mut(&pair)
-                            .map(|count| { *count += 1; })
-                            .unwrap_or_else(|| {
-                                thread_frequencies.insert(StringPair(pair.0.clone(), pair.1.clone()), 1);
-                            });
-                        progress.inc(1);
-                    }
-                    progress.finish_and_clear();
-
-                    thread_frequencies
+                    let progress_message = format!("Counting token pairs; thread {:02}/{:02}", index + 1, threads);
+                    Tokenizer::get_pair_frequencies(chunk, progress, progress_message)
                 });
             }
             let values = thread_join.join_all().await;
-            let mut frequencies = HashMap::<(CompactString, CompactString), usize>::new();
+
+            println!("Joining thread frequencies...");
+            let mut frequencies = IndexMap::<(CompactString, CompactString), usize>::new();
             for value in values {
                 for (pair, count) in value {
                     *frequencies.entry((pair.0, pair.1)).or_insert(0) += count;
                 }
             }
 
+            let pair_count = frequencies.len();
+            println!("Found {} pairs in {}s. Finding most frequent pair...", pair_count, start_time.elapsed().as_secs());
+
             // Find the most frequent pair of tokens
-            let most_frequent_pair = frequencies.iter().max_by_key(|(_, &count)| count);
+            let bin_size = pair_count.div_ceil(threads);
+            let frequencies = Arc::new(RwLock::new(frequencies));
+
+            // Parallelize the search for the most frequent pair
+            let mut thread_join = JoinSet::new();
+            for i in 0..threads {
+                let frequencies = frequencies.clone();
+                thread_join.spawn(async move {
+                    let frequencies = frequencies.try_read().expect("Somehow the RwLock is already locked");
+                    let mut most_frequent_pair = None;
+                    let mut most_frequent_count = 0;
+                    for (pair, count) in frequencies.iter().skip(i * bin_size).take(bin_size) {
+                        if *count > most_frequent_count {
+                            most_frequent_pair = Some(pair.clone());
+                            most_frequent_count = *count;
+                        }
+                    }
+
+                    (most_frequent_pair, most_frequent_count)
+                });
+            }
+            let most_frequent_pair = thread_join.join_all().await.into_iter().max_by_key(|(_, count)| *count);
+
             if most_frequent_pair.is_none() {
+                println!("No pair found. Ending tokenizer build.");
                 break; // If we didn't find a pair, we're done
             }
 
             let pair = most_frequent_pair.unwrap().0.clone();
+            if pair.is_none() {
+                println!("No pair found. Ending tokenizer build.");
+                break; // If we didn't find a pair, we're done
+            }
+            let pair = pair.unwrap();
             let (first, second) = pair.clone();
             let mut new_token = format_compact!("{}{}", first, second);
             new_token.shrink_to_fit();
@@ -298,37 +322,16 @@ impl Tokenizer {
             for (index, chunk) in token_chunks.iter().enumerate() {
                 let chunk = chunk.clone();
                 let progress = multi_progress.clone();
-                let new_token = new_token.clone();
                 let pair = pair.clone();
                 thread_join.spawn(async move {
-                    let (first, second) = pair.clone();
-                    
                     let mut chunk = chunk.try_write().expect("Somehow the RwLock is already locked");
-
-                    let progress = progress.add(ProgressBar::new(chunk.len() as u64 * 2)
-                        .with_prefix(format!("Merging token pair {:?}; thread {:02}/{:02}", pair, index + 1, threads))
-                        .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap()));
-
-                    let mut i = 0;
-                    while i < chunk.len() - 1 {
-                        if chunk[i].as_ref().unwrap() == first && chunk[i + 1].as_ref().unwrap() == second {
-                            chunk[i] = Some(new_token.clone());
-                            chunk[i + 1] = None;
-                            i += 1;
-                        }
-                        i += 1;
-                        progress.inc(1);
-                    }
-
-                    progress.set_message("Cleaning up...");
-                    chunk.retain(|token| token.is_some());
-
-                    progress.finish_and_clear();
+                    let progress_message = format!("Merging token pair {:?}; thread {:02}/{:02}", pair, index + 1, threads);
+                    Tokenizer::merge_tokens(&mut chunk, pair, progress_message, progress);
                 });
             }
             thread_join.join_all().await;
 
-            println!("Finished merging tokens in memory.");
+            println!("Finished merging tokens in memory in {}s.", start_time.elapsed().as_secs());
         }
 
         println!("Tokenizer built with {} tokens. Saving to disk...", tokenizer.token_map.0.len());
@@ -338,10 +341,153 @@ impl Tokenizer {
         let mut merges_file = fs::File::create(MERGES_FILE.clone()).unwrap();
         vocab_file.write_all(bincode::serialize(&tokenizer.token_map).unwrap().as_slice()).unwrap();
         merges_file.write_all(bincode::serialize(&tokenizer.merges).unwrap().as_slice()).unwrap();
+
+        // Delete the temporary files
+        fs::remove_file(TEMP_VOCAB_FILE.clone()).unwrap();
+        fs::remove_file(TEMP_MERGES_FILE.clone()).unwrap();
         
         println!("Saved tokenizer vocab and merges.");
 
         tokenizer
+    }
+
+    fn merge_tokens(chunk: &mut String, pair: (CompactString, CompactString), progress_message: String, progress: MultiProgress) {
+        let (first, second) = pair.clone();
+        let new_token = format!("{}{}", first, second);
+        
+        const PROGRESS_STEP: usize = 10_000;
+        let progress = progress.add(ProgressBar::new((chunk.len() / PROGRESS_STEP) as u64)
+            .with_prefix(progress_message)
+            .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap()));
+
+        /// The number of tokens to modify in a single batch.
+        /// This is a tradeoff between memory usage and speed (since updating the original string is O(n))
+        const CHUNK_MODIFICATION_CHARACTER_BATCH: usize = 200_000_000;
+        let mut new_chunk = String::new();
+        let mut last_token = String::new();
+        let mut current_token = String::new();
+        // In order to avoid doubling the memory usage, we modify the chunk (somewhat) in-place:
+        // Every CHUNK_MODIFICATION_TOKEN_BATCH tokens, we clear the start of the chunk.
+        let mut i = 0;
+        while chunk.len() > 0 {
+            let mut length_taken = 0;
+            for char in chunk.chars() {
+                length_taken += char.len_utf8();
+
+                i += 1;
+                if i % PROGRESS_STEP == 0 {
+                    progress.inc(1);
+                }
+
+                if char == '\0' {
+                    if current_token.is_empty() {
+                        // This is the end of a preliminary token; don't count a pair across this boundary.
+                        new_chunk.push_str(&last_token);
+                        new_chunk.push('\0');
+                        new_chunk.push('\0');
+                        last_token.clear();
+                        current_token.clear();
+                        continue;
+                    }
+
+                    let should_merge = last_token == first && current_token == second;
+                    if !last_token.is_empty() && !should_merge {
+                        new_chunk.push_str(&last_token);
+                        new_chunk.push('\0');
+                    }
+                    if length_taken >= CHUNK_MODIFICATION_CHARACTER_BATCH {
+                        break;
+                    }
+
+                    if should_merge {
+                        last_token = new_token.clone();
+                    } else {
+                        last_token = current_token.clone();
+                    }
+                    current_token.clear();
+                    continue;
+                }
+
+                current_token.push(char);
+            }
+            if !last_token.is_empty() {
+                if !current_token.is_empty() && last_token == first && current_token == second {
+                    new_chunk.push_str(&new_token);
+                } else {
+                    new_chunk.push_str(&last_token);
+                    if !current_token.is_empty() {
+                        new_chunk.push('\0');
+                        new_chunk.push_str(&current_token);
+                    }
+                }
+            } else {
+                new_chunk.push_str(&current_token);
+            }
+
+            chunk.drain(..length_taken);
+            chunk.shrink_to_fit();
+        }
+
+        new_chunk.shrink_to_fit();
+        *chunk = new_chunk;
+        
+        progress.finish_and_clear();
+    }
+
+    fn get_pair_frequencies(chunk: Arc<RwLock<String>>, progress: MultiProgress, progress_message: String) -> HashMap<StringPair, usize> {
+        let mut thread_frequencies = HashMap::<StringPair, usize>::new();
+            
+        let chunk = &chunk.try_read().expect("Somehow the RwLock is messed up");
+
+        const PROGRESS_STEP: usize = 10_000;
+        let progress = progress.add(ProgressBar::new((chunk.len() / PROGRESS_STEP) as u64)
+            .with_prefix(progress_message)
+            .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len}").unwrap()));
+        
+        let mut last_token = String::new();
+        let mut current_token = String::new();
+        for (i, char) in chunk.chars().enumerate() {
+            if i % PROGRESS_STEP == 0 {
+                progress.inc(1);
+            }
+
+            if char == '\0' {
+                if current_token.is_empty() {
+                    // This is the end of a preliminary token; don't count a pair across this boundary.
+                    last_token.clear();
+                    current_token.clear();
+                    continue;
+                }
+
+                if !last_token.is_empty() {
+                    // This is the end of a token; add the pair to the frequency map.
+                    let pair = (last_token.to_compact_string(), current_token.to_compact_string());
+                    thread_frequencies.get_mut(&pair)
+                        .map(|count| { *count += 1; })
+                        .unwrap_or_else(|| {
+                            thread_frequencies.insert(StringPair(pair.0.clone(), pair.1.clone()), 1);
+                        });
+                }
+
+                last_token = current_token.clone();
+                current_token.clear();
+                continue;
+            }
+
+            current_token.push(char);
+        }
+        if !last_token.is_empty() {
+            let pair = (last_token.to_compact_string(), current_token.to_compact_string());
+            thread_frequencies.get_mut(&pair)
+                .map(|count| { *count += 1; })
+                .unwrap_or_else(|| {
+                    thread_frequencies.insert(StringPair(pair.0.clone(), pair.1.clone()), 1);
+                });
+        }
+
+        progress.finish_and_clear();
+
+        thread_frequencies
     }
 
     /// Gets all possible pairs of tokens in a string.
@@ -533,6 +679,7 @@ pub async fn tokenize(text: String) {
     let tokens = tokenizer.tokenize(&text);
     println!("Token IDs: {:?}", tokens);
     println!("Token literals: {:?}", tokens.iter().map(|token| tokenizer.reverse_token_map.get(token).unwrap()).collect::<Vec<&CompactString>>());
+    println!("Detokenized: {}", tokenizer.detokenize(&tokens));
 }
 
 pub async fn detokenize(tokens: String) {
@@ -540,4 +687,44 @@ pub async fn detokenize(tokens: String) {
     let tokens: Vec<usize> = tokens.split_whitespace().map(|token| token.replace(",", "").parse().unwrap()).collect();
     let text = tokenizer.detokenize(&tokens);
     println!("{}", text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_tokens() {
+        let mut chunk = "h\0e\0l\0l\0o\0\0 \0w\0o\0r\0l\0d\0\0 \0h\0e\0l\0l\0o".to_string();
+        let pair = (CompactString::from("l"), CompactString::from("l"));
+        Tokenizer::merge_tokens(&mut chunk, pair, "Merging tokens".to_string(), MultiProgress::new());
+        assert_eq!(chunk, "h\0e\0ll\0o\0\0 \0w\0o\0r\0l\0d\0\0 \0h\0e\0ll\0o");
+
+        let pair = (CompactString::from("o"), CompactString::from("w"));
+        Tokenizer::merge_tokens(&mut chunk, pair, "Merging tokens".to_string(), MultiProgress::new());
+        assert_eq!(chunk, "h\0e\0ll\0o\0\0 \0w\0o\0r\0l\0d\0\0 \0h\0e\0ll\0o");
+
+        let pair = (CompactString::from("ll"), CompactString::from("o"));
+        Tokenizer::merge_tokens(&mut chunk, pair, "Merging tokens".to_string(), MultiProgress::new());
+        assert_eq!(chunk, "h\0e\0llo\0\0 \0w\0o\0r\0l\0d\0\0 \0h\0e\0llo");
+
+        // Test with a bunch of garbage generated data and a merge that doesn't exist
+        let mut chunk = String::new();
+        for _ in 0..1000 {
+            chunk.push_str("a\0b\0c\0d\0e\0f\0g\0h\0i\0j\0k\0l\0m\0n\0o\0p\0q\0r\0s\0t\0u\0v\0w\0x\0y\0z\0\0 ");
+        }
+        let original_chunk = chunk.clone();
+        let pair = (CompactString::from("z"), CompactString::from("z"));
+        Tokenizer::merge_tokens(&mut chunk, pair, "Merging tokens".to_string(), MultiProgress::new());
+        assert_eq!(chunk, original_chunk);
+    }
+    
+    #[test]
+    fn get_thread_frequencies() {
+        let chunk = Arc::new(RwLock::new("Token1\0Token2\0Token3\0\0Token1\0Token2".to_string()));
+        let frequencies = Tokenizer::get_pair_frequencies(chunk, MultiProgress::new(), "Counting token pairs".to_string());
+        assert_eq!(frequencies.get(&StringPair("Token1".to_compact_string(), "Token2".to_compact_string())).unwrap(), &2);
+        assert_eq!(frequencies.get(&StringPair("Token2".to_compact_string(), "Token3".to_compact_string())).unwrap(), &1);
+        assert_eq!(frequencies.len(), 2);
+    }
 }
