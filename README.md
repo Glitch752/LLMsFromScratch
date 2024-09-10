@@ -6,6 +6,11 @@ For my first implementation, I'll skip gathering training data, and I'll instead
 
 I'm implementing this in Rust, but I plan to reimplement the relevant parts using CUDA for GPU acceleration.
 
+## Roadmap
+- [x] Implement a byte-pair encoding tokenizer
+  - The tokenizer performance isn't very good, but it can generate about 4,000 tokens per day on my mid-range machine when using a quarter of the ~50GB dataset. I'll try to optimize it when the need arises, but this works for now.
+- [ ] TODO
+
 ## Project structure
 - `src/` contains the Rust source code
 - `scripts/` contains scripts to help with the project (probably will end up being mostly Jupyter notebooks for data analysis)

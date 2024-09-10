@@ -26,6 +26,7 @@ fn cli() -> Command {
         .subcommand(tokenizer::generate_vocab_cli())
         .subcommand(tokenizer::tokenize_cli())
         .subcommand(tokenizer::detokenize_cli())
+        .subcommand(tokenizer::fix_tokenizer_cli())
 }
 
 #[tokio::main]
@@ -41,8 +42,9 @@ async fn main() {
             *sub_matches.get_one::<bool>("continue").unwrap(),
             *sub_matches.get_one::<f64>("data_ratio").unwrap(),
         ).await,
-        Some((tokenizer::TOKENIZE_SUBCOMMAND, sub_matches)) => _ = tokenizer::tokenize(sub_matches.get_one::<String>("text").unwrap().clone()).await,
-        Some((tokenizer::DETOKENIZE_SUBCOMMAND, sub_matches)) => _ = tokenizer::detokenize(sub_matches.get_one::<String>("tokens").unwrap().clone()).await,
+        Some((tokenizer::TOKENIZE_SUBCOMMAND, sub_matches)) => _ = tokenizer::tokenize(sub_matches.get_one::<String>("text").unwrap().clone(), *sub_matches.get_one::<bool>("use_temporary_files").unwrap()).await,
+        Some((tokenizer::DETOKENIZE_SUBCOMMAND, sub_matches)) => _ = tokenizer::detokenize(sub_matches.get_one::<String>("tokens").unwrap().clone(), *sub_matches.get_one::<bool>("use_temporary_files").unwrap()).await,
+        Some((tokenizer::FIX_TOKENIZER_SUBCOMMAND, _)) => _ = tokenizer::fix_tokenizer().await,
         _ => unreachable!(),
     }
 }

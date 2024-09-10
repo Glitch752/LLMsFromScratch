@@ -23,12 +23,19 @@ pub fn tokenize_cli() -> Command {
     Command::new(TOKENIZE_SUBCOMMAND)
         .about("Tokenize a string using the tokenizer. Input is a string of text.")
         .arg(Arg::new("text").help("The text to tokenize.").required(true))
+        .arg(Arg::new("use_temporary_files").help("Use the temporary files generated during the tokenizer build process.").long("use-temporary-files").action(clap::ArgAction::SetTrue))
 }
 pub const DETOKENIZE_SUBCOMMAND: &str = "detokenize";
 pub fn detokenize_cli() -> Command {
     Command::new(DETOKENIZE_SUBCOMMAND)
         .about("Detokenize a list of token IDs using the tokenizer. Input is a list of integers separated by spaces.")
         .arg(Arg::new("tokens").help("The list of token IDs to detokenize.").required(true))
+        .arg(Arg::new("use_temporary_files").help("Use the temporary files generated during the tokenizer build process.").long("use-temporary-files").action(clap::ArgAction::SetTrue))
+}
+pub const FIX_TOKENIZER_SUBCOMMAND: &str = "fix_tokenizer";
+pub fn fix_tokenizer_cli() -> Command {
+    Command::new(FIX_TOKENIZER_SUBCOMMAND)
+        .about("Fix the tokenizer result by removing invalid merges. This shouldn't be necessary, but the tokenizer is somewhat buggy.")
 }
 
 const UNKNOWN_TOKEN: &str = "<|unk|>";
@@ -189,7 +196,7 @@ impl Tokenizer {
 
             progress.finish_and_clear();
         }
-        let token_chunks = token_chunks.into_iter().map(Arc::new).collect::<Vec<_>>();
+        let token_chunks = token_chunks.into_iter().map(RwLock::new).map(Arc::new).collect::<Vec<_>>();
 
         println!("Loaded data from {} subsets into memory.", max_subset_count);
 
@@ -198,38 +205,10 @@ impl Tokenizer {
         let mut thread_join: JoinSet<String> = JoinSet::new();
         for (index, chunk) in token_chunks.iter().enumerate() {
             let chunk = chunk.clone();
-            let mut tokenizer = tokenizer.clone();
+            let tokenizer = tokenizer.clone();
             let progress = multi_progress.clone();
             thread_join.spawn(async move {
-                let progress = progress.add(ProgressBar::new(chunk.len() as u64)
-                    .with_prefix(format!("Tokenizing data; thread {:02}/{:02}", index, threads))
-                    .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len}").unwrap()));
-                
-                let mut new_chunk: String = String::new();
-                for input in chunk.iter() {
-                    let preliminary_tokens = Tokenizer::split_into_preliminary_tokens(input);
-                    for preliminary_token in preliminary_tokens {
-                        // We use a null byte as a separator, so we need to remove it from the input. I could probably replace it with something else, but we realistically don't need to generate null bytes.
-                        let tokens = tokenizer.bpe(preliminary_token).into_iter().map(|s| s.replace("\0", "")).map(Some);
-                        for token in tokens {
-                            new_chunk.push_str(&token.unwrap());
-                            new_chunk.push('\0'); // We use a null byte as a separator
-                        }
-                        // Add an extra null token to the end of this split token
-                        new_chunk.push('\0');
-                    }
-
-                    // The null separators indicate boundaries as follows:
-                    // - 1 null byte: End of a token (so this is the boundary of a pair)
-                    // - 2 null bytes: End of a token and end of a preliminary token (so don't count a pair across this boundary)
-
-                    progress.inc(1);
-                }
-                new_chunk.shrink_to_fit();
-
-                progress.finish_and_clear();
-                
-                new_chunk
+                Tokenizer::convert_to_string_chunk(chunk, tokenizer, format!("Tokenizing data; thread {:02}/{:02}", index, threads), progress)
             });
         }
         let token_chunks = thread_join.join_all().await.into_iter().map(RwLock::new).map(Arc::new).collect::<Vec<_>>();
@@ -311,8 +290,7 @@ impl Tokenizer {
             println!("Found pair {:?} to merge into token #{} in {}s.", pair, id, start_time.elapsed().as_secs());
 
             println!("Saving temporary tokenizer state...");
-            fs::File::create(TEMP_VOCAB_FILE.clone()).unwrap().write_all(bincode::serialize(&tokenizer.token_map).unwrap().as_slice()).unwrap();
-            fs::File::create(TEMP_MERGES_FILE.clone()).unwrap().write_all(bincode::serialize(&tokenizer.merges).unwrap().as_slice()).unwrap();
+            tokenizer.save(true);
 
             println!("Merging tokens in memory...");
             
@@ -336,11 +314,7 @@ impl Tokenizer {
 
         println!("Tokenizer built with {} tokens. Saving to disk...", tokenizer.token_map.0.len());
 
-        // Write the token map and merges to disk
-        let mut vocab_file = fs::File::create(VOCAB_FILE.clone()).unwrap();
-        let mut merges_file = fs::File::create(MERGES_FILE.clone()).unwrap();
-        vocab_file.write_all(bincode::serialize(&tokenizer.token_map).unwrap().as_slice()).unwrap();
-        merges_file.write_all(bincode::serialize(&tokenizer.merges).unwrap().as_slice()).unwrap();
+        tokenizer.save(false);
 
         // Delete the temporary files
         fs::remove_file(TEMP_VOCAB_FILE.clone()).unwrap();
@@ -349,6 +323,79 @@ impl Tokenizer {
         println!("Saved tokenizer vocab and merges.");
 
         tokenizer
+    }
+
+    pub fn convert_to_string_chunk(chunk: Arc<RwLock<Vec<String>>>, mut tokenizer: Tokenizer, progress_message: String, progress: MultiProgress) -> String {
+        let mut chunk = chunk.try_write().expect("Somehow the chunk RwLock is messed up");
+
+        const PROGRESS_STEP: usize = 10;
+        let progress = progress.add(ProgressBar::new((chunk.len() / PROGRESS_STEP) as u64)
+            .with_prefix(progress_message)
+            .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len}").unwrap()));
+        
+        /// The number of bytes to modify in a single batch.
+        /// This is a tradeoff between memory usage and speed (since updating the original string is O(n))
+        const CHUNK_MODIFICATION_CHARACTER_BATCH: usize = 50_000_000;
+
+        let mut new_chunk: String = String::new();
+        let mut i = 0;
+        while chunk.len() > 0 {
+            let mut length_taken = 0;
+            let mut inputs_taken = 0;
+            for input in chunk.iter() {
+                length_taken += input.len();
+                inputs_taken += 1;
+
+                i += 1;
+                if i % PROGRESS_STEP == 0 {
+                    progress.inc(1);
+                }
+
+                let preliminary_tokens = Tokenizer::split_into_preliminary_tokens(input);
+                for preliminary_token in preliminary_tokens {
+                    // We use a null byte as a separator, so we need to remove it from the input. I could probably replace it with something else, but we realistically don't need to generate null bytes.
+                    let tokens = tokenizer.bpe(preliminary_token).into_iter().map(|s| s.replace("\0", "")).map(Some);
+                    for token in tokens {
+                        new_chunk.push_str(&token.unwrap());
+                        new_chunk.push('\0'); // We use a null byte as a separator
+                    }
+                    // Add an extra null token to the end of this split token
+                    new_chunk.push('\0');
+                }
+
+                // The null separators indicate boundaries as follows:
+                // - 1 null byte: End of a token (so this is the boundary of a pair)
+                // - 2 null bytes: End of a token and end of a preliminary token (so don't count a pair across this boundary)
+                
+                if length_taken >= CHUNK_MODIFICATION_CHARACTER_BATCH {
+                    break;
+                }
+            }
+
+            chunk.drain(..inputs_taken);
+            chunk.shrink_to_fit();
+        }
+
+        new_chunk.shrink_to_fit();
+
+        progress.finish_and_clear();
+
+        new_chunk
+    }
+
+    pub fn save(&self, temporary: bool) {
+        let mut vocab_file = if temporary {
+            fs::File::create(TEMP_VOCAB_FILE.clone()).unwrap()
+        } else {
+            fs::File::create(VOCAB_FILE.clone()).unwrap()
+        };
+        let mut merges_file = if temporary {
+            fs::File::create(TEMP_MERGES_FILE.clone()).unwrap()
+        } else {
+            fs::File::create(MERGES_FILE.clone()).unwrap()
+        };
+        vocab_file.write_all(bincode::serialize(&self.token_map).unwrap().as_slice()).unwrap();
+        merges_file.write_all(bincode::serialize(&self.merges).unwrap().as_slice()).unwrap();
     }
 
     fn merge_tokens(chunk: &mut String, pair: (CompactString, CompactString), progress_message: String, progress: MultiProgress) {
@@ -360,14 +407,14 @@ impl Tokenizer {
             .with_prefix(progress_message)
             .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap()));
 
-        /// The number of tokens to modify in a single batch.
+        /// The number of characters to modify in a single batch.
         /// This is a tradeoff between memory usage and speed (since updating the original string is O(n))
-        const CHUNK_MODIFICATION_CHARACTER_BATCH: usize = 200_000_000;
+        const CHUNK_MODIFICATION_CHARACTER_BATCH: usize = 100_000_000;
         let mut new_chunk = String::new();
         let mut last_token = String::new();
         let mut current_token = String::new();
         // In order to avoid doubling the memory usage, we modify the chunk (somewhat) in-place:
-        // Every CHUNK_MODIFICATION_TOKEN_BATCH tokens, we clear the start of the chunk.
+        // Every CHUNK_MODIFICATION_TOKEN_BATCH characters, we clear the start of the chunk.
         let mut i = 0;
         while chunk.len() > 0 {
             let mut length_taken = 0;
@@ -559,7 +606,10 @@ impl Tokenizer {
 
         let mut bytepair_tokens: Vec<usize> = vec![];
         for preliminary_token in preliminary_tokens {
-            bytepair_tokens.extend(self.bpe(preliminary_token).iter().map(|token| *self.token_map.0.get(token).unwrap_or(self.token_map.0.get(UNKNOWN_TOKEN).unwrap())));
+            bytepair_tokens.extend(self.bpe(preliminary_token).iter().map(|token| *self.token_map.0.get(token).unwrap_or_else(|| {
+                println!("Warning: Unknown token found: \"{}\"", token);
+                self.token_map.0.get(UNKNOWN_TOKEN).unwrap()
+            })));
         }
 
         bytepair_tokens
@@ -674,19 +724,100 @@ impl Tokenizer {
     }
 }
 
-pub async fn tokenize(text: String) {
-    let mut tokenizer = Tokenizer::load(false);
+pub async fn tokenize(text: String, use_temporary_files: bool) {
+    let mut tokenizer = Tokenizer::load(use_temporary_files);
     let tokens = tokenizer.tokenize(&text);
     println!("Token IDs: {:?}", tokens);
     println!("Token literals: {:?}", tokens.iter().map(|token| tokenizer.reverse_token_map.get(token).unwrap()).collect::<Vec<&CompactString>>());
-    println!("Detokenized: {}", tokenizer.detokenize(&tokens));
+    println!("Detokenized: \"{}\"", tokenizer.detokenize(&tokens));
 }
 
-pub async fn detokenize(tokens: String) {
-    let tokenizer = Tokenizer::load(false);
+pub async fn detokenize(tokens: String, use_temporary_files: bool) {
+    let tokenizer = Tokenizer::load(use_temporary_files);
     let tokens: Vec<usize> = tokens.split_whitespace().map(|token| token.replace(",", "").parse().unwrap()).collect();
     let text = tokenizer.detokenize(&tokens);
     println!("{}", text);
+}
+
+pub async fn fix_tokenizer() {
+    // Load the tokenizer. If the final files don't exist, use the temporary files.
+    let mut tokenizer = if MERGES_FILE.exists() && VOCAB_FILE.exists() {
+        // Back up the final files
+        let mut backup_vocab_file = VOCAB_FILE.clone().with_extension("bin.bak");
+        let mut i = 0;
+        while backup_vocab_file.exists() {
+            i += 1;
+            backup_vocab_file = VOCAB_FILE.clone().with_extension(format!("bin.bak.{}", i));
+        }
+        fs::copy(VOCAB_FILE.clone(), backup_vocab_file).unwrap();
+
+        let mut backup_merges_file = MERGES_FILE.clone().with_extension("bin.bak");
+        let mut i = 0;
+        while backup_merges_file.exists() {
+            i += 1;
+            backup_merges_file = MERGES_FILE.clone().with_extension(format!("bin.bak.{}", i));
+        }
+        fs::copy(MERGES_FILE.clone(), backup_merges_file).unwrap();
+
+        Tokenizer::load(false)
+    } else if !TEMP_MERGES_FILE.exists() || !TEMP_VOCAB_FILE.exists() {
+        panic!("fix_tokenizer requires either temporary intermediate tokenizer state stored or a finished tokenizer vocab and merges file.");
+    } else {
+        // If the final files don't exist, use the temporary files
+        // Back up the temporary files
+        let mut backup_vocab_file = TEMP_VOCAB_FILE.clone().with_extension("tmp.bak");
+        let mut i = 0;
+        while backup_vocab_file.exists() {
+            i += 1;
+            backup_vocab_file = TEMP_VOCAB_FILE.clone().with_extension(format!("tmp.bak.{}", i));
+        }
+        fs::copy(TEMP_VOCAB_FILE.clone(), backup_vocab_file).unwrap();
+
+        let mut backup_merges_file = TEMP_MERGES_FILE.clone().with_extension("tmp.bak");
+        let mut i = 0;
+        while backup_merges_file.exists() {
+            i += 1;
+            backup_merges_file = TEMP_MERGES_FILE.clone().with_extension(format!("tmp.bak.{}", i));
+        }
+        fs::copy(TEMP_MERGES_FILE.clone(), backup_merges_file).unwrap();
+
+        Tokenizer::load(true)
+    };
+
+    // Find all the tokens with a space in them (that isn't at the start, discluding tokens that are entirely whitespace)
+    let mut tokens_to_fix = vec![];
+    for (token, id) in tokenizer.token_map.0.iter() {
+        if !token.trim().is_empty() && token.chars().count() > 2 {
+            let sub_token: String = token.chars().skip(1).take(token.chars().count() - 2).collect();
+            if sub_token.contains(' ') {
+                tokens_to_fix.push((token.clone(), *id));
+            }
+        }
+    }
+
+    println!("Identified {} tokens requiring fixing: {}", tokens_to_fix.len(), tokens_to_fix.clone().into_iter().map(|e| { format!("\"{}\"", e.0) }).collect::<Vec<_>>().join(", "));
+
+    // Remove all tokens in tokens_to_fix and all merges that contain them
+    for (token, id) in tokens_to_fix {
+        tokenizer.token_map.0.remove(&token);
+        tokenizer.reverse_token_map.remove(&id);
+    }
+
+    // Remove all merges that contain or result in tokens that don't exist
+    let mut merges_to_remove = vec![];
+    for (pair, _) in tokenizer.merges.0.iter() {
+        if !tokenizer.token_map.0.contains_key(&pair.0) || !tokenizer.token_map.0.contains_key(&pair.1) || !tokenizer.token_map.0.contains_key(&format_compact!("{}{}", pair.0, pair.1)) {
+            merges_to_remove.push(pair.clone());
+        }
+    }
+
+    for pair in merges_to_remove {
+        tokenizer.merges.0.remove(&pair);
+    }
+
+    println!("New token count: {}.", tokenizer.token_map.0.len());
+
+    tokenizer.save(!MERGES_FILE.exists() || !VOCAB_FILE.exists());
 }
 
 #[cfg(test)]
@@ -700,7 +831,7 @@ mod tests {
         Tokenizer::merge_tokens(&mut chunk, pair, "Merging tokens".to_string(), MultiProgress::new());
         assert_eq!(chunk, "h\0e\0ll\0o\0\0 \0w\0o\0r\0l\0d\0\0 \0h\0e\0ll\0o");
 
-        let pair = (CompactString::from("o"), CompactString::from("w"));
+        let pair = (CompactString::from("o"), CompactString::from(" "));
         Tokenizer::merge_tokens(&mut chunk, pair, "Merging tokens".to_string(), MultiProgress::new());
         assert_eq!(chunk, "h\0e\0ll\0o\0\0 \0w\0o\0r\0l\0d\0\0 \0h\0e\0ll\0o");
 
@@ -714,7 +845,7 @@ mod tests {
             chunk.push_str("a\0b\0c\0d\0e\0f\0g\0h\0i\0j\0k\0l\0m\0n\0o\0p\0q\0r\0s\0t\0u\0v\0w\0x\0y\0z\0\0 ");
         }
         let original_chunk = chunk.clone();
-        let pair = (CompactString::from("z"), CompactString::from("z"));
+        let pair = (CompactString::from("z"), CompactString::from(" "));
         Tokenizer::merge_tokens(&mut chunk, pair, "Merging tokens".to_string(), MultiProgress::new());
         assert_eq!(chunk, original_chunk);
     }
@@ -726,5 +857,18 @@ mod tests {
         assert_eq!(frequencies.get(&StringPair("Token1".to_compact_string(), "Token2".to_compact_string())).unwrap(), &2);
         assert_eq!(frequencies.get(&StringPair("Token2".to_compact_string(), "Token3".to_compact_string())).unwrap(), &1);
         assert_eq!(frequencies.len(), 2);
+
+        let mut chunk = String::new();
+        for _ in 0..1000 {
+            chunk.push_str("a\0b\0\0 \0d\0e\0\0 \0 \0\0");
+        }
+        let chunk = Arc::new(RwLock::new(chunk));
+
+        let frequencies = Tokenizer::get_pair_frequencies(chunk, MultiProgress::new(), "Counting token pairs".to_string());
+        assert_eq!(frequencies.len(), 4);
+        assert_eq!(frequencies.get(&StringPair("a".to_compact_string(), "b".to_compact_string())).unwrap(), &1000);
+        assert_eq!(frequencies.get(&StringPair(" ".to_compact_string(), "d".to_compact_string())).unwrap(), &1000);
+        assert_eq!(frequencies.get(&StringPair("d".to_compact_string(), "e".to_compact_string())).unwrap(), &1000);
+        assert_eq!(frequencies.get(&StringPair(" ".to_compact_string(), " ".to_compact_string())).unwrap(), &1000);
     }
 }
