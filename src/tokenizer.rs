@@ -274,7 +274,7 @@ impl Tokenizer {
                 break; // If we didn't find a pair, we're done
             }
 
-            let pair = most_frequent_pair.unwrap().0.clone();
+            let pair = most_frequent_pair.clone().unwrap().0;
             if pair.is_none() {
                 println!("No pair found. Ending tokenizer build.");
                 break; // If we didn't find a pair, we're done
@@ -287,7 +287,7 @@ impl Tokenizer {
             let id = tokenizer.add_token(new_token.clone());
             tokenizer.merges.0.insert(StringPair(first, second), id);
 
-            println!("Found pair {:?} to merge into token #{} in {}s.", pair, id, start_time.elapsed().as_secs());
+            println!("Found pair {:?} with {} matches to merge into token #{} in {}s.", pair, most_frequent_pair.unwrap().1, id, start_time.elapsed().as_secs());
 
             println!("Saving temporary tokenizer state...");
             tokenizer.save(true);
@@ -353,10 +353,9 @@ impl Tokenizer {
 
                 let preliminary_tokens = Tokenizer::split_into_preliminary_tokens(input);
                 for preliminary_token in preliminary_tokens {
-                    // We use a null byte as a separator, so we need to remove it from the input. I could probably replace it with something else, but we realistically don't need to generate null bytes.
-                    let tokens = tokenizer.bpe(preliminary_token).into_iter().map(|s| s.replace("\0", "")).map(Some);
+                    let tokens = tokenizer.bpe(preliminary_token);
                     for token in tokens {
-                        new_chunk.push_str(&token.unwrap());
+                        new_chunk.push_str(&token);
                         new_chunk.push('\0'); // We use a null byte as a separator
                     }
                     // Add an extra null token to the end of this split token
@@ -558,29 +557,36 @@ impl Tokenizer {
 
         loop {
             // First, we find the most important pair to merge (meaning the pair that occurs most frequently)
-            let most_important_pair = pairs.iter().map(|pair| (pair, self.merges.0.get(pair).unwrap_or(&usize::MAX))).min_by_key(|(_, index)| **index);
+            let most_important_pair = pairs.into_iter().min_by_key(|pair| self.merges.0.get(pair).unwrap_or(&usize::MAX));
             // If we didn't find a pair to merge, we're done
-            if most_important_pair.is_none() || *most_important_pair.unwrap().1 == usize::MAX {
+            if most_important_pair.is_none() {
                 break;
             }
-            let (first, second) = most_important_pair.unwrap().0;
+            let most_important_pair = most_important_pair.unwrap();
+            if self.merges.0.get(&most_important_pair).is_none() {
+                break;
+            }
+
+            let (first, second) = most_important_pair;
 
             // Next, we merge the pair
             let mut new_tokens = vec![];
             let mut i = 0;
             while i < tokens.len() {
-                let j = tokens.iter().skip(i).position(|token| token == first);
-                if let Some(j) = j {
-                    new_tokens.extend(tokens[i..i + j].iter().cloned());
-                    i += j;
+                let mut j = i;
+                while j < tokens.len() {
+                    if tokens[j] == first && j < tokens.len() - 1 && tokens[j + 1] == second {
+                        new_tokens.push(format_compact!("{}{}", first, second));
+                        i = j + 2;
+                        break;
+                    }
+
+                    new_tokens.push(tokens[j].clone());
+                    j += 1;
                 }
 
-                if i < tokens.len() - 1 && tokens[i + 1] == *second {
-                    new_tokens.push(format_compact!("{}{}", first, second));
-                    i += 2;
-                } else {
-                    new_tokens.push(tokens[i].clone());
-                    i += 1;
+                if j == tokens.len() {
+                    break;
                 }
             }
 
@@ -726,6 +732,7 @@ impl Tokenizer {
 
 pub async fn tokenize(text: String, use_temporary_files: bool) {
     let mut tokenizer = Tokenizer::load(use_temporary_files);
+    println!("Preliminary tokens: {:?}", Tokenizer::split_into_preliminary_tokens(&text));
     let tokens = tokenizer.tokenize(&text);
     println!("Token IDs: {:?}", tokens);
     println!("Token literals: {:?}", tokens.iter().map(|token| tokenizer.reverse_token_map.get(token).unwrap()).collect::<Vec<&CompactString>>());
@@ -823,6 +830,16 @@ pub async fn fix_tokenizer() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convert_to_string_chunk() {
+        let chunk = Arc::new(RwLock::new(vec!["Hello, world!".to_string(), "This is a test.".to_string()]));
+        let mut tokenizer = Tokenizer::new();
+        tokenizer.add_token("ll".to_compact_string());
+        tokenizer.merges.0.insert(StringPair("l".to_compact_string(), "l".to_compact_string()), 1);
+        let new_chunk = Tokenizer::convert_to_string_chunk(chunk, tokenizer, "Converting to string chunk".to_string(), MultiProgress::new());
+        assert_eq!(new_chunk, "H\0e\0ll\0o\0\0,\0\0 \0w\0o\0r\0l\0d\0\0!\0\0T\0h\0i\0s\0\0 \0i\0s\0\0 \0a\0\0 \0t\0e\0s\0t\0\0.\0\0");
+    }
 
     #[test]
     fn merge_tokens() {
