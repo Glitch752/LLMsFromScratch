@@ -122,6 +122,10 @@ impl Tokenizer {
 
     fn add_token(&mut self, token: CompactString) -> u32 {
         let value = self.token_map.0.len() as u32;
+        if self.reverse_token_map.contains_key(&value) {
+            panic!("Token ID collision! Token ID {} already exists for token \"{}\".", value, self.reverse_token_map.get(&value).unwrap());
+        }
+
         self.token_map.0.insert(token.clone(), value);
         self.reverse_token_map.insert(value, token);
         value
@@ -348,7 +352,9 @@ impl Tokenizer {
         /// This is a tradeoff between memory usage and speed (since updating the original string is O(n))
         const CHUNK_MODIFICATION_CHARACTER_BATCH: usize = 50_000_000;
 
-        let mut tokenized_data: Vec<u32> = vec![];
+        let separator_token_id = *self.token_map.0.get(&SEPARATOR_TOKEN.to_compact_string()).unwrap();
+
+        let mut tokenized_data: Vec<u32> = vec![];                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
         let mut i = 0;
         while chunk.len() > 0 {
             let mut length_taken = 0;
@@ -366,12 +372,9 @@ impl Tokenizer {
                 for preliminary_token in preliminary_tokens {
                     let tokens = self.bpe(preliminary_token);
                     for token in tokens {
-                        tokenized_data.push(*self.token_map.0.get(&token).unwrap_or_else(|| {
-                            println!("Warning: Unknown token found: \"{}\"", token);
-                            self.token_map.0.get(UNKNOWN_TOKEN).unwrap()
-                        }));
+                        tokenized_data.push(*self.token_map.0.get(&token).expect("BPE returned an invalid token!"));
                     }
-                    tokenized_data.push(*self.token_map.0.get(&SEPARATOR_TOKEN.to_compact_string()).unwrap());
+                    tokenized_data.push(separator_token_id);
                 }
 
                 // The null separators indicate boundaries as follows:
@@ -409,6 +412,10 @@ impl Tokenizer {
         merges_file.write_all(bincode::serialize(&self.merges).unwrap().as_slice()).unwrap();
     }
 
+    pub fn regenerate_reverse_token_map() {
+        // TODO: Slightly reorganize to generate the reverse token map here
+    }
+
     fn merge_tokens(chunk: &mut Vec<u32>, pair: (u32, u32), new_id: u32, progress_message: String, progress: MultiProgress) {
         const PROGRESS_STEP: usize = 10_000;
         let progress = progress.add(ProgressBar::new((chunk.len() / PROGRESS_STEP) as u64)
@@ -438,7 +445,7 @@ impl Tokenizer {
 
     fn get_pair_frequencies(separater_token_id: u32, chunk: Arc<RwLock<Vec<u32>>>, progress: MultiProgress, progress_message: String) -> HashMap<(u32, u32), usize> {
         let mut thread_frequencies = HashMap::<(u32, u32), usize>::new();
-            
+        
         let chunk = &chunk.try_read().expect("Somehow the RwLock is messed up");
 
         const PROGRESS_STEP: usize = 10_000;
@@ -769,6 +776,53 @@ pub async fn fix_tokenizer() {
         tokenizer.merges.0.remove(&pair);
     }
 
+    // Ensure no tokens share the same ID
+    let mut id_map = HashMap::<u32, CompactString>::new();
+    let mut conflicting_tokens = vec![];
+    for (token, id) in tokenizer.token_map.0.iter() {
+        if id_map.contains_key(id) {
+            conflicting_tokens.push((id_map.get(id).unwrap().clone(), token.clone()));
+        }
+        id_map.insert(*id, token.clone());
+    }
+
+    println!("Identified {} conflicting tokens: {}", conflicting_tokens.len(), conflicting_tokens.clone().into_iter().map(|e| { format!("\"{}\" and \"{}\"", e.0, e.1) }).collect::<Vec<_>>().join(", "));
+
+    // Fix the conflicting tokens
+    for (_, token) in &conflicting_tokens {
+        tokenizer.token_map.0.remove(token);
+    }
+    for (_, token) in &conflicting_tokens {
+        tokenizer.add_token(token.clone());
+    }
+    if conflicting_tokens.len() > 0 {
+        tokenizer.reverse_token_map = tokenizer.token_map.0.iter().map(|(k, v)| (*v, k.clone())).collect();
+    }
+
+    // Check if there are any skipped IDs
+    let mut skipped_ids = vec![];
+    for i in 0..tokenizer.token_map.0.len() as u32 {
+        if !tokenizer.reverse_token_map.contains_key(&i) {
+            skipped_ids.push(i);
+        }
+    }
+
+    println!("Identified {} skipped IDs: {}", skipped_ids.len(), skipped_ids.clone().into_iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "));
+
+    // Fix the skipped IDs
+    for (idx, skipped_id) in skipped_ids.iter().enumerate() {
+        for(token, token_id) in tokenizer.token_map.0.iter_mut() {
+            if *token_id > *skipped_id - idx as u32 {
+                *token_id -= 1;
+                tokenizer.reverse_token_map.remove(token_id);
+                tokenizer.reverse_token_map.insert(*token_id, token.clone());
+            }
+        }
+    }
+    if skipped_ids.len() > 0 {
+        tokenizer.reverse_token_map = tokenizer.token_map.0.iter().map(|(k, v)| (*v, k.clone())).collect();
+    }
+
     println!("New token count: {}.", tokenizer.token_map.0.len());
 
     tokenizer.save(!MERGES_FILE.exists() || !VOCAB_FILE.exists());
@@ -776,17 +830,26 @@ pub async fn fix_tokenizer() {
 
 #[cfg(test)]
 mod tests {
-    // use super::*;
-
-    #[test]
-    fn convert_to_string_chunk() {
-    }
+    use super::*;
 
     #[test]
     fn merge_tokens() {
+        let mut chunk = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        Tokenizer::merge_tokens(&mut chunk, (3, 4), 11, "Merging tokens".to_string(), MultiProgress::new());
+        assert_eq!(chunk, vec![1, 2, 11, 5, 6, 7, 8, 9, 10]);
+
+        let mut chunk = vec![1, 2, 1, 2, 2, 1, 3, 2, 1, 2];
+        Tokenizer::merge_tokens(&mut chunk, (1, 2), 4, "Merging tokens".to_string(), MultiProgress::new());
+        assert_eq!(chunk, vec![4, 4, 2, 1, 3, 2, 4]);
     }
     
     #[test]
-    fn get_thread_frequencies() {
+    fn get_pair_frequencies() {
+        let chunk = vec![1, 2, 0, 3, 4, 5, 0, 6];
+        let frequencies = Tokenizer::get_pair_frequencies(0, Arc::new(RwLock::new(chunk)), MultiProgress::new(), "Counting token pairs".to_string());
+        assert_eq!(frequencies.len(), 3);
+        assert_eq!(frequencies.get(&(1, 2)).unwrap(), &1);
+        assert_eq!(frequencies.get(&(3, 4)).unwrap(), &1);
+        assert_eq!(frequencies.get(&(4, 5)).unwrap(), &1);
     }
 }
