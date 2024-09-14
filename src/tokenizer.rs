@@ -1,6 +1,6 @@
 /// This is a basic byte-pair encoding tokenizer. It is used to tokenize the input text into subwords.
 
-use std::{fs, io::Write, path::PathBuf, sync::{Arc, RwLock}};
+use std::{collections::BTreeMap, fs, io::Write, path::PathBuf, sync::{Arc, RwLock}};
 use clap::{Arg, Command};
 use indexmap::IndexMap;
 use indicatif::{MultiProgress, ProgressBar};
@@ -114,10 +114,13 @@ impl Tokenizer {
         
         tokenizer.token_map = token_map;
         tokenizer.merges = merges;
-        
-        tokenizer.reverse_token_map = tokenizer.token_map.0.iter().map(|(k, v)| (*v, k.clone())).collect();
+        tokenizer.regenerate_reverse_token_map();
 
         tokenizer
+    }
+
+    pub fn regenerate_reverse_token_map(&mut self) {
+        self.reverse_token_map = self.token_map.0.iter().map(|(k, v)| (*v, k.clone())).collect();
     }
 
     fn add_token(&mut self, token: CompactString) -> u32 {
@@ -125,9 +128,17 @@ impl Tokenizer {
         if self.reverse_token_map.contains_key(&value) {
             panic!("Token ID collision! Token ID {} already exists for token \"{}\".", value, self.reverse_token_map.get(&value).unwrap());
         }
+        if self.token_map.0.contains_key(&token) {
+            panic!("Token already exists! Token \"{}\" already has ID {}.", token, self.token_map.0.get(&token).unwrap());
+        }
 
         self.token_map.0.insert(token.clone(), value);
         self.reverse_token_map.insert(value, token);
+
+        if self.reverse_token_map.len() != self.token_map.0.len() {
+            panic!("Token map and reverse token map are out of sync! Token map has {} entries, reverse token map has {} entries.", self.token_map.0.len(), self.reverse_token_map.len());
+        }
+
         value
     }
 
@@ -253,7 +264,7 @@ impl Tokenizer {
             let mut frequencies = IndexMap::<(u32, u32), usize>::new();
             for value in values {
                 for (pair, count) in value {
-                    *frequencies.entry((pair.0, pair.1)).or_insert(0) += count;
+                    *frequencies.entry(pair).or_insert(0) += count;
                 }
             }
 
@@ -287,6 +298,10 @@ impl Tokenizer {
             if most_frequent_pair.is_none() {
                 println!("No pair found. Ending tokenizer build.");
                 break; // If we didn't find a pair, we're done
+            }
+            if most_frequent_pair.unwrap().1 == 0 {
+                println!("No pair found with a count greater than 0. Ending tokenizer build.");
+                break; // If we didn't find a pair with a count greater than 0, we're done
             }
 
             let pair = most_frequent_pair.clone().unwrap().0;
@@ -412,10 +427,6 @@ impl Tokenizer {
         merges_file.write_all(bincode::serialize(&self.merges).unwrap().as_slice()).unwrap();
     }
 
-    pub fn regenerate_reverse_token_map() {
-        // TODO: Slightly reorganize to generate the reverse token map here
-    }
-
     fn merge_tokens(chunk: &mut Vec<u32>, pair: (u32, u32), new_id: u32, progress_message: String, progress: MultiProgress) {
         const PROGRESS_STEP: usize = 10_000;
         let progress = progress.add(ProgressBar::new((chunk.len() / PROGRESS_STEP) as u64)
@@ -443,8 +454,8 @@ impl Tokenizer {
         progress.finish_and_clear();
     }
 
-    fn get_pair_frequencies(separater_token_id: u32, chunk: Arc<RwLock<Vec<u32>>>, progress: MultiProgress, progress_message: String) -> HashMap<(u32, u32), usize> {
-        let mut thread_frequencies = HashMap::<(u32, u32), usize>::new();
+    fn get_pair_frequencies(separater_token_id: u32, chunk: Arc<RwLock<Vec<u32>>>, progress: MultiProgress, progress_message: String) -> Vec<((u32, u32), usize)> {
+        let mut thread_frequencies = BTreeMap::<u64, usize>::new();
         
         let chunk = &chunk.try_read().expect("Somehow the RwLock is messed up");
 
@@ -461,16 +472,16 @@ impl Tokenizer {
                 progress.inc(1);
             }
 
-            if *token != separater_token_id && last_token != separater_token_id {            
-                let pair = (last_token, *token);
-                *thread_frequencies.entry(pair).or_insert(0) += 1;
+            if *token != separater_token_id && last_token != separater_token_id {
+                *thread_frequencies.entry((last_token as u64) | ((*token as u64) << 32)).or_insert(0) += 1;
             }
             last_token = *token;
         }
 
         progress.finish_and_clear();
 
-        thread_frequencies
+        let result = thread_frequencies.into_iter().map(|(pair, count)| (((pair & 0xFFFFFFFF) as u32, (pair >> 32) as u32), count)).collect();
+        result
     }
 
     /// Gets all possible pairs of tokens in a string.
@@ -742,7 +753,7 @@ pub async fn fix_tokenizer() {
         }
         new_token_map.insert(SEPARATOR_TOKEN.to_compact_string(), SEPARATOR_ID);
         tokenizer.token_map = TokenMap(new_token_map);
-        tokenizer.reverse_token_map = tokenizer.token_map.0.iter().map(|(k, v)| (*v, k.clone())).collect();
+        tokenizer.regenerate_reverse_token_map();
     }
 
     // Find all the tokens with a space in them (that isn't at the start, discluding tokens that are entirely whitespace)
@@ -753,6 +764,9 @@ pub async fn fix_tokenizer() {
             if sub_token.contains(' ') {
                 tokens_to_fix.push((token.clone(), *id));
             }
+        }
+        if token.contains("<|unk|>") {
+            tokens_to_fix.push((token.clone(), *id));
         }
     }
 
@@ -796,7 +810,7 @@ pub async fn fix_tokenizer() {
         tokenizer.add_token(token.clone());
     }
     if conflicting_tokens.len() > 0 {
-        tokenizer.reverse_token_map = tokenizer.token_map.0.iter().map(|(k, v)| (*v, k.clone())).collect();
+        tokenizer.regenerate_reverse_token_map();
     }
 
     // Check if there are any skipped IDs
@@ -820,7 +834,7 @@ pub async fn fix_tokenizer() {
         }
     }
     if skipped_ids.len() > 0 {
-        tokenizer.reverse_token_map = tokenizer.token_map.0.iter().map(|(k, v)| (*v, k.clone())).collect();
+        tokenizer.regenerate_reverse_token_map();
     }
 
     println!("New token count: {}.", tokenizer.token_map.0.len());
@@ -848,8 +862,8 @@ mod tests {
         let chunk = vec![1, 2, 0, 3, 4, 5, 0, 6];
         let frequencies = Tokenizer::get_pair_frequencies(0, Arc::new(RwLock::new(chunk)), MultiProgress::new(), "Counting token pairs".to_string());
         assert_eq!(frequencies.len(), 3);
-        assert_eq!(frequencies.get(&(1, 2)).unwrap(), &1);
-        assert_eq!(frequencies.get(&(3, 4)).unwrap(), &1);
-        assert_eq!(frequencies.get(&(4, 5)).unwrap(), &1);
+        assert!(frequencies.contains(&((1, 2), 1)));
+        assert!(frequencies.contains(&((3, 4), 1)));
+        assert!(frequencies.contains(&((4, 5), 1)));
     }
 }
