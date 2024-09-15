@@ -1,6 +1,6 @@
 /// This is a basic byte-pair encoding tokenizer. It is used to tokenize the input text into subwords.
 
-use std::{collections::BTreeMap, fs, io::Write, path::PathBuf, sync::{Arc, RwLock}};
+use std::{fs, io::Write, path::PathBuf, sync::{Arc, RwLock}};
 use clap::{Arg, Command};
 use indexmap::IndexMap;
 use indicatif::{MultiProgress, ProgressBar};
@@ -240,6 +240,8 @@ impl Tokenizer {
 
         println!("Finished tokenizing data.");
 
+        let mut pair_count_guess = 0;
+
         // Next, we run the BPE algorithm to create subword tokens until we reach the desired vocabulary size.
         while tokenizer.token_map.0.len() < VOCAB_SIZE {
             println!("Vocab size is now {}/{}. Finding next token pair...", tokenizer.token_map.0.len(), VOCAB_SIZE);
@@ -255,18 +257,21 @@ impl Tokenizer {
                 let progress = multi_progress.clone();
                 thread_join.spawn(async move {
                     let progress_message = format!("Counting token pairs; thread {:02}/{:02}", index + 1, threads);
-                    Tokenizer::get_pair_frequencies(separater_token_id, chunk, progress, progress_message)
+                    Tokenizer::get_pair_frequencies(separater_token_id, chunk, progress, progress_message, pair_count_guess)
                 });
             }
             let values = thread_join.join_all().await;
 
             println!("Joining thread frequencies...");
             let mut frequencies = IndexMap::<(u32, u32), usize>::new();
+            let mut pair_counts = vec![];
             for value in values {
+                pair_counts.push(value.len());
                 for (pair, count) in value {
                     *frequencies.entry(pair).or_insert(0) += count;
                 }
             }
+            pair_count_guess = pair_counts.iter().sum::<usize>() / threads;
 
             let pair_count = frequencies.len();
             println!("Found {} pairs in {}s. Finding most frequent pair...", pair_count, start_time.elapsed().as_secs());
@@ -454,8 +459,8 @@ impl Tokenizer {
         progress.finish_and_clear();
     }
 
-    fn get_pair_frequencies(separater_token_id: u32, chunk: Arc<RwLock<Vec<u32>>>, progress: MultiProgress, progress_message: String) -> Vec<((u32, u32), usize)> {
-        let mut thread_frequencies = BTreeMap::<u64, usize>::new();
+    fn get_pair_frequencies(separater_token_id: u32, chunk: Arc<RwLock<Vec<u32>>>, progress: MultiProgress, progress_message: String, pair_count_guess: usize) -> Vec<((u32, u32), usize)> {
+        let mut thread_frequencies = HashMap::with_capacity(pair_count_guess);
         
         let chunk = &chunk.try_read().expect("Somehow the RwLock is messed up");
 
@@ -860,7 +865,7 @@ mod tests {
     #[test]
     fn get_pair_frequencies() {
         let chunk = vec![1, 2, 0, 3, 4, 5, 0, 6];
-        let frequencies = Tokenizer::get_pair_frequencies(0, Arc::new(RwLock::new(chunk)), MultiProgress::new(), "Counting token pairs".to_string());
+        let frequencies = Tokenizer::get_pair_frequencies(0, Arc::new(RwLock::new(chunk)), MultiProgress::new(), "Counting token pairs".to_string(), 0);
         assert_eq!(frequencies.len(), 3);
         assert!(frequencies.contains(&((1, 2), 1)));
         assert!(frequencies.contains(&((3, 4), 1)));
