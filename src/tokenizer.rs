@@ -42,7 +42,9 @@ const UNKNOWN_TOKEN: &str = "<|unk|>";
 const ENDOFTEXT_TOKEN: &str = "<|endoftext|>";
 const SEPARATOR_TOKEN: &str = "<|sep|>";
 
-const VOCAB_SIZE: usize = 50_000;
+type TokenId = u16;
+// Maximum value is 65536 because I'm currenting using an unsigned 16-bit integer for token IDs. If we ever need more tokens, I can change this to u32 and make a small migration script.
+const VOCAB_SIZE: TokenId = 50_000;
 const SIMULTANEOUS_FILE_LOADS: usize = 32;
 
 lazy_static! {
@@ -55,11 +57,11 @@ lazy_static! {
 
 /// A map from pairs of tokens to the BPE rank. Lower ranks indicate more frequent pairs.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Merges(HashMap<StringPair, u32>);
+struct Merges(HashMap<StringPair, TokenId>);
 
 /// A map from token string to token ID.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct TokenMap(HashMap<CompactString, u32>);
+struct TokenMap(HashMap<CompactString, TokenId>);
 
 #[derive(Clone, Debug)]
 pub struct Tokenizer {
@@ -69,7 +71,7 @@ pub struct Tokenizer {
     /// Map from token string to token ID.
     token_map: TokenMap,
     /// Map from token ID to token string.
-    reverse_token_map: HashMap<u32, CompactString>
+    reverse_token_map: HashMap<TokenId, CompactString>
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, Eq, PartialEq)]
@@ -123,8 +125,8 @@ impl Tokenizer {
         self.reverse_token_map = self.token_map.0.iter().map(|(k, v)| (*v, k.clone())).collect();
     }
 
-    fn add_token(&mut self, token: CompactString) -> u32 {
-        let value = self.token_map.0.len() as u32;
+    fn add_token(&mut self, token: CompactString) -> TokenId {
+        let value = self.token_map.0.len() as TokenId;
         if self.reverse_token_map.contains_key(&value) {
             panic!("Token ID collision! Token ID {} already exists for token \"{}\".", value, self.reverse_token_map.get(&value).unwrap());
         }
@@ -142,7 +144,7 @@ impl Tokenizer {
         value
     }
 
-    fn add_merge(&mut self, pair: (CompactString, CompactString)) -> u32 {
+    fn add_merge(&mut self, pair: (CompactString, CompactString)) -> TokenId {
         let id = self.add_token(format_compact!("{}{}", pair.0, pair.1));
         self.merges.0.insert(StringPair(pair.0, pair.1), id);
         id
@@ -221,15 +223,14 @@ impl Tokenizer {
 
             progress.finish_and_clear();
         }
-        let token_chunks = token_chunks.into_iter().map(RwLock::new).map(Arc::new).collect::<Vec<_>>();
+        let token_chunks = token_chunks.into_iter().collect::<Vec<_>>();
 
         println!("Loaded data from {} subsets into memory.", max_subset_count);
 
         // Next, run the BPE algorithm in parallel on the chunks of data.
         let multi_progress = MultiProgress::new();
-        let mut thread_join: JoinSet<Vec<u32>> = JoinSet::new();
-        for (index, chunk) in token_chunks.iter().enumerate() {
-            let chunk = chunk.clone();
+        let mut thread_join: JoinSet<Vec<TokenId>> = JoinSet::new();
+        for (index, chunk) in token_chunks.into_iter().enumerate() {
             let mut tokenizer = tokenizer.clone();
             let progress = multi_progress.clone();
             thread_join.spawn(async move {
@@ -243,7 +244,7 @@ impl Tokenizer {
         let mut pair_count_guess = 0;
 
         // Next, we run the BPE algorithm to create subword tokens until we reach the desired vocabulary size.
-        while tokenizer.token_map.0.len() < VOCAB_SIZE {
+        while (tokenizer.token_map.0.len() as TokenId) < VOCAB_SIZE {
             println!("Vocab size is now {}/{}. Finding next token pair...", tokenizer.token_map.0.len(), VOCAB_SIZE);
 
             let start_time = std::time::Instant::now();
@@ -263,7 +264,7 @@ impl Tokenizer {
             let values = thread_join.join_all().await;
 
             println!("Joining thread frequencies...");
-            let mut frequencies = IndexMap::<(u32, u32), usize>::new();
+            let mut frequencies = IndexMap::<(TokenId, TokenId), usize>::new();
             let mut pair_counts = vec![];
             for value in values {
                 pair_counts.push(value.len());
@@ -360,9 +361,7 @@ impl Tokenizer {
         tokenizer
     }
 
-    pub fn tokenize_chunk(&mut self, chunk: Arc<RwLock<Vec<String>>>, progress_message: String, progress: MultiProgress) -> Vec<u32> {
-        let mut chunk = chunk.try_write().expect("Somehow the chunk RwLock is messed up");
-
+    pub fn tokenize_chunk(&mut self, mut chunk: Vec<String>, progress_message: String, progress: MultiProgress) -> Vec<TokenId> {
         const PROGRESS_STEP: usize = 10;
         let progress = progress.add(ProgressBar::new((chunk.len() / PROGRESS_STEP) as u64)
             .with_prefix(progress_message)
@@ -374,7 +373,7 @@ impl Tokenizer {
 
         let separator_token_id = *self.token_map.0.get(&SEPARATOR_TOKEN.to_compact_string()).unwrap();
 
-        let mut tokenized_data: Vec<u32> = vec![];                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
+        let mut tokenized_data: Vec<TokenId> = vec![];                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
         let mut i = 0;
         while chunk.len() > 0 {
             let mut length_taken = 0;
@@ -432,13 +431,13 @@ impl Tokenizer {
         merges_file.write_all(bincode::serialize(&self.merges).unwrap().as_slice()).unwrap();
     }
 
-    fn merge_tokens(chunk: &mut Vec<u32>, pair: (u32, u32), new_id: u32, progress_message: String, progress: MultiProgress) {
+    fn merge_tokens(chunk: &mut Vec<TokenId>, pair: (TokenId, TokenId), new_id: TokenId, progress_message: String, progress: MultiProgress) {
         const PROGRESS_STEP: usize = 10_000;
         let progress = progress.add(ProgressBar::new((chunk.len() / PROGRESS_STEP) as u64)
             .with_prefix(progress_message)
             .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len} | {msg}").unwrap()));
 
-        const UNKNOWN_TOKEN: u32 = 0;
+        const UNKNOWN_TOKEN: TokenId = 0;
         
         let mut i = 0;
         while i < chunk.len() - 1 {
@@ -459,7 +458,7 @@ impl Tokenizer {
         progress.finish_and_clear();
     }
 
-    fn get_pair_frequencies(separater_token_id: u32, chunk: Arc<RwLock<Vec<u32>>>, progress: MultiProgress, progress_message: String, pair_count_guess: usize) -> Vec<((u32, u32), usize)> {
+    fn get_pair_frequencies(separater_token_id: TokenId, chunk: Arc<RwLock<Vec<TokenId>>>, progress: MultiProgress, progress_message: String, pair_count_guess: usize) -> Vec<((TokenId, TokenId), usize)> {
         let mut thread_frequencies = HashMap::with_capacity(pair_count_guess);
         
         let chunk = &chunk.try_read().expect("Somehow the RwLock is messed up");
@@ -470,7 +469,7 @@ impl Tokenizer {
             .with_style(indicatif::ProgressStyle::default_bar().template("{prefix} {bar:60.cyan/blue} {pos}/{len}").unwrap()));
         
         let mut i = 0;
-        let mut last_token: u32 = separater_token_id;
+        let mut last_token: TokenId = separater_token_id;
         for token in chunk.iter() {
             i += 1;
             if i % PROGRESS_STEP == 0 {
@@ -478,14 +477,14 @@ impl Tokenizer {
             }
 
             if *token != separater_token_id && last_token != separater_token_id {
-                *thread_frequencies.entry((last_token as u64) | ((*token as u64) << 32)).or_insert(0) += 1;
+                *thread_frequencies.entry((last_token as u32) | ((*token as u32) << 16)).or_insert(0) += 1;
             }
             last_token = *token;
         }
 
         progress.finish_and_clear();
 
-        let result = thread_frequencies.into_iter().map(|(pair, count)| (((pair & 0xFFFFFFFF) as u32, (pair >> 32) as u32), count)).collect();
+        let result = thread_frequencies.into_iter().map(|(pair, count)| (((pair & 0xFFFF) as TokenId, (pair >> 16) as TokenId), count)).collect();
         result
     }
 
@@ -510,7 +509,7 @@ impl Tokenizer {
 
         loop {
             // First, we find the most important pair to merge (meaning the pair that occurs most frequently)
-            let most_important_pair = pairs.into_iter().min_by_key(|pair| self.merges.0.get(pair).unwrap_or(&u32::MAX));
+            let most_important_pair = pairs.into_iter().min_by_key(|pair| self.merges.0.get(pair).unwrap_or(&TokenId::MAX));
             // If we didn't find a pair to merge, we're done
             if most_important_pair.is_none() {
                 break;
@@ -560,10 +559,10 @@ impl Tokenizer {
     }
 
     /// Converts a text into a list of token IDs.
-    pub fn tokenize(&mut self, text: &str) -> Vec<u32> {
+    pub fn tokenize(&mut self, text: &str) -> Vec<TokenId> {
         let preliminary_tokens = Tokenizer::split_into_preliminary_tokens(text);
 
-        let mut bytepair_tokens: Vec<u32> = vec![];
+        let mut bytepair_tokens: Vec<TokenId> = vec![];
         for preliminary_token in preliminary_tokens {
             bytepair_tokens.extend(self.bpe(preliminary_token).iter().map(|token| *self.token_map.0.get(token).unwrap_or_else(|| {
                 println!("Warning: Unknown token found: \"{}\"", token);
@@ -575,7 +574,7 @@ impl Tokenizer {
     }
 
     /// Converts a list of token IDs back into text.
-    pub fn detokenize(&self, tokens: &[u32]) -> String {
+    pub fn detokenize(&self, tokens: &[TokenId]) -> String {
         let mut text = String::new();
 
         for token in tokens {
@@ -694,7 +693,7 @@ pub async fn tokenize(text: String, use_temporary_files: bool) {
 
 pub async fn detokenize(tokens: String, use_temporary_files: bool) {
     let tokenizer = Tokenizer::load(use_temporary_files);
-    let tokens: Vec<u32> = tokens.split_whitespace().map(|token| token.replace(",", "").parse().unwrap()).collect();
+    let tokens: Vec<TokenId> = tokens.split_whitespace().map(|token| token.replace(",", "").parse::<TokenId>().unwrap()).collect();
     let text = tokenizer.detokenize(&tokens);
     println!("{}", text);
 }
@@ -747,8 +746,8 @@ pub async fn fix_tokenizer() {
     // If SEPARATOR_TOKEN doesn't exist in the token map, shift all tokens up by one and add it
     if !tokenizer.token_map.0.contains_key(SEPARATOR_TOKEN) {
         println!("Adding separator token to tokenizer.");
-        let mut new_token_map = HashMap::<CompactString, u32>::new();
-        const SEPARATOR_ID: u32 = 2;
+        let mut new_token_map = HashMap::<CompactString, TokenId>::new();
+        const SEPARATOR_ID: TokenId = 2;
         for (token, id) in tokenizer.token_map.0.iter() {
             if *id >= SEPARATOR_ID {
                 new_token_map.insert(token.clone(), id - 1);
@@ -796,7 +795,7 @@ pub async fn fix_tokenizer() {
     }
 
     // Ensure no tokens share the same ID
-    let mut id_map = HashMap::<u32, CompactString>::new();
+    let mut id_map = HashMap::<TokenId, CompactString>::new();
     let mut conflicting_tokens = vec![];
     for (token, id) in tokenizer.token_map.0.iter() {
         if id_map.contains_key(id) {
@@ -820,7 +819,7 @@ pub async fn fix_tokenizer() {
 
     // Check if there are any skipped IDs
     let mut skipped_ids = vec![];
-    for i in 0..tokenizer.token_map.0.len() as u32 {
+    for i in 0..tokenizer.token_map.0.len() as TokenId {
         if !tokenizer.reverse_token_map.contains_key(&i) {
             skipped_ids.push(i);
         }
@@ -831,7 +830,7 @@ pub async fn fix_tokenizer() {
     // Fix the skipped IDs
     for (idx, skipped_id) in skipped_ids.iter().enumerate() {
         for(token, token_id) in tokenizer.token_map.0.iter_mut() {
-            if *token_id > *skipped_id - idx as u32 {
+            if *token_id > *skipped_id - idx as TokenId {
                 *token_id -= 1;
                 tokenizer.reverse_token_map.remove(token_id);
                 tokenizer.reverse_token_map.insert(*token_id, token.clone());
