@@ -12,7 +12,6 @@ dependencies = [
  "dotenv",
  "futures-util",
  "hashbrown",
- "indexmap",
  "indicatif",
  "lazy_static",
  "num_cpus",

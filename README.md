@@ -8,7 +8,8 @@ I'm implementing this in Rust, but I plan to reimplement the relevant parts usin
 
 ## Roadmap
 - [x] Implement a byte-pair encoding tokenizer
-  - The tokenizer performance isn't very good, but it can generate about 4,000 tokens per day on my mid-range machine when using a quarter of the ~50GB dataset. I'll try to optimize it when the need arises, but this works for now.
+  - The tokenizer performance isn't very good, but it can generate about 6,000 tokens per day on my mid-range machine when using the entire ~50GB dataset. I'll try to optimize it when the need arises, but this works for now.
+- 
 - [ ] TODO
 
 ## Project structure

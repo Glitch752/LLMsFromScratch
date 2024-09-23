@@ -2,7 +2,6 @@
 
 use std::{fs, io::Write, path::PathBuf, sync::{Arc, RwLock}};
 use clap::{Arg, Command};
-use indexmap::IndexMap;
 use indicatif::{MultiProgress, ProgressBar};
 use lazy_static::lazy_static;
 use hashbrown::{Equivalent, HashMap};
@@ -264,7 +263,7 @@ impl Tokenizer {
             let values = thread_join.join_all().await;
 
             println!("Joining thread frequencies...");
-            let mut frequencies = IndexMap::<(TokenId, TokenId), usize>::new();
+            let mut frequencies = HashMap::<(TokenId, TokenId), usize>::new();
             let mut pair_counts = vec![];
             for value in values {
                 pair_counts.push(value.len());
@@ -273,6 +272,7 @@ impl Tokenizer {
                 }
             }
             pair_count_guess = pair_counts.iter().sum::<usize>() / threads;
+            let frequencies = frequencies.into_iter().collect::<Vec<_>>();
 
             let pair_count = frequencies.len();
             println!("Found {} pairs in {}s. Finding most frequent pair...", pair_count, start_time.elapsed().as_secs());
@@ -289,7 +289,8 @@ impl Tokenizer {
                     let frequencies = frequencies.try_read().expect("Somehow the RwLock is already locked");
                     let mut most_frequent_pair = None;
                     let mut most_frequent_count = 0;
-                    for (pair, count) in frequencies.iter().skip(i * bin_size).take(bin_size) {
+                    for i in (i * bin_size)..((i + 1) * bin_size).min(frequencies.len()) {
+                        let (pair, count) = frequencies.get(i).unwrap();
                         if *count > most_frequent_count {
                             most_frequent_pair = Some(pair.clone());
                             most_frequent_count = *count;
@@ -390,9 +391,7 @@ impl Tokenizer {
                 let preliminary_tokens = Tokenizer::split_into_preliminary_tokens(input);
                 for preliminary_token in preliminary_tokens {
                     let tokens = self.bpe(preliminary_token);
-                    for token in tokens {
-                        tokenized_data.push(*self.token_map.0.get(&token).expect("BPE returned an invalid token!"));
-                    }
+                    tokenized_data.extend(tokens.iter().map(|token| *self.token_map.0.get(token).expect("BPE returned an invalid token!")));
                     tokenized_data.push(separator_token_id);
                 }
 
