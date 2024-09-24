@@ -144,9 +144,14 @@ impl Tokenizer {
     }
 
     fn add_merge(&mut self, pair: (CompactString, CompactString)) -> TokenId {
-        let id = self.add_token(format_compact!("{}{}", pair.0, pair.1));
-        self.merges.0.insert(StringPair(pair.0, pair.1), id);
-        id
+        let new_token = format_compact!("{}{}", pair.0, pair.1);
+        if !self.token_map.0.contains_key(&new_token) {
+            self.add_token(new_token.clone());
+        }
+        // Finding the maximum value is a bit of a hack maintained since I originally was using token IDs as the rank, which didn't account for edge cases where multiple merges
+        // could form the same token.
+        self.merges.0.insert(StringPair(pair.0, pair.1), self.merges.0.values().max().unwrap_or(&0) + 1);
+        self.token_map.0.get(&new_token).unwrap().clone()
     }
     
     pub async fn build_token_map(load_previous: bool, data_ratio: f64) -> Self {
@@ -768,7 +773,7 @@ pub async fn fix_tokenizer() {
                 tokens_to_fix.push((token.clone(), *id));
             }
         }
-        if token.contains("<|unk|>") {
+        if token.contains("<|unk|>") && token != UNKNOWN_TOKEN {
             tokens_to_fix.push((token.clone(), *id));
         }
     }
@@ -788,6 +793,8 @@ pub async fn fix_tokenizer() {
             merges_to_remove.push(pair.clone());
         }
     }
+
+    println!("Identified {} merges to remove: {}", merges_to_remove.len(), merges_to_remove.clone().into_iter().map(|e| { format!("{:?}", e) }).collect::<Vec<_>>().join(", "));
 
     for pair in merges_to_remove {
         tokenizer.merges.0.remove(&pair);
