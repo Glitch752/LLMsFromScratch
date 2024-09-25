@@ -11,6 +11,7 @@ use dotenv::dotenv;
 
 mod downloader;
 mod tokenizer;
+mod train;
 
 lazy_static! {
     pub static ref DATA_PATH: PathBuf = PathBuf::from(env::var("DATA_DIRECTORY").expect("DATA_DIRECTORY must be set with a .env file or in the environment"));
@@ -27,6 +28,8 @@ fn cli() -> Command {
         .subcommand(tokenizer::tokenize_cli())
         .subcommand(tokenizer::detokenize_cli())
         .subcommand(tokenizer::fix_tokenizer_cli())
+        .subcommand(tokenizer::view_tokenizer_cli())
+        .subcommand(train::cli())
 }
 
 #[tokio::main]
@@ -45,6 +48,8 @@ async fn main() {
         Some((tokenizer::TOKENIZE_SUBCOMMAND, sub_matches)) => _ = tokenizer::tokenize(sub_matches.get_one::<String>("text").unwrap().clone(), *sub_matches.get_one::<bool>("use_temporary_files").unwrap()).await,
         Some((tokenizer::DETOKENIZE_SUBCOMMAND, sub_matches)) => _ = tokenizer::detokenize(sub_matches.get_one::<String>("tokens").unwrap().clone(), *sub_matches.get_one::<bool>("use_temporary_files").unwrap()).await,
         Some((tokenizer::FIX_TOKENIZER_SUBCOMMAND, _)) => _ = tokenizer::fix_tokenizer().await,
+        Some((tokenizer::VIEW_TOKENIZER_SUBCOMMAND, sub_matches)) => tokenizer::view_tokenizer(*sub_matches.get_one::<bool>("use_temporary_files").unwrap()).await,
+        Some((train::TRAIN_SUBCOMMAND, _)) => train::train().unwrap(),
         _ => unreachable!(),
     }
 }

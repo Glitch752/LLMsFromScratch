@@ -6,6 +6,9 @@ For my first implementation, I'll skip gathering training data, and I'll instead
 
 I'm implementing this in Rust, but I plan to reimplement the relevant parts using CUDA for GPU acceleration.
 
+## Building / running
+Currently, I don't distribute binaries since the project is a work in progress. To build and run the project, you need Rust and the CUDA toolkit with CUDNN and NVRTC included.
+
 ## Roadmap
 - [x] Implement a byte-pair encoding tokenizer
   - The tokenizer performance isn't very good, but it can generate about 6,000 tokens per day on my mid-range machine when using the entire ~50GB dataset. I'll try to optimize it when the need arises, but this works for now.

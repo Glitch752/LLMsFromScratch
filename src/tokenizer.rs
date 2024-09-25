@@ -36,6 +36,12 @@ pub fn fix_tokenizer_cli() -> Command {
     Command::new(FIX_TOKENIZER_SUBCOMMAND)
         .about("Fix the tokenizer result by removing invalid merges. This shouldn't be necessary, but the tokenizer is somewhat buggy.")
 }
+pub const VIEW_TOKENIZER_SUBCOMMAND: &str = "view_tokenizer";
+pub fn view_tokenizer_cli() -> Command {
+    Command::new(VIEW_TOKENIZER_SUBCOMMAND)
+        .about("View the finished tokenizer merges and tokens.")
+        .arg(Arg::new("use_temporary_files").help("Use the temporary files generated during the tokenizer build process.").long("use-temporary-files").action(clap::ArgAction::SetTrue))
+}
 
 const UNKNOWN_TOKEN: &str = "<|unk|>";
 const ENDOFTEXT_TOKEN: &str = "<|endoftext|>";
@@ -850,6 +856,18 @@ pub async fn fix_tokenizer() {
     println!("New token count: {}.", tokenizer.token_map.0.len());
 
     tokenizer.save(!MERGES_FILE.exists() || !VOCAB_FILE.exists());
+}
+
+pub async fn view_tokenizer(use_temporary_files: bool) {
+    let tokenizer = Tokenizer::load(use_temporary_files);
+    println!("Tokenizer tokens:");
+    for (token, id) in tokenizer.token_map.0.iter() {
+        println!("  {:05} -> \"{}\"", id, token);
+    }
+    println!("Tokenizer merges:");
+    for (pair, id) in tokenizer.merges.0.iter() {
+        println!("  (\"{}\", \"{}\") -> {}", pair.0, pair.1, id);
+    }
 }
 
 #[cfg(test)]
